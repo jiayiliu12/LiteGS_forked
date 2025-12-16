@@ -637,217 +637,66 @@ class CreateViewProjFunc(torch.autograd.Function):
         return grad_position, grad_orientation, None, None, None, None
 
 class Binning(BaseWrapper):
-    # @torch.no_grad()
-    # def __binning_script(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,
-    #         img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
-    #     def create_2d_AABB(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,tile_size:tuple[int, int],img_pixel_shape:tuple[int,int],img_tile_shape:tuple[int,int]):
-    #         # Major and minor axes -> AABB extensions
-    #         opacity_clamped=opacity.unsqueeze(0).clamp_min(1/255)
-    #         coefficient=2*((255*opacity_clamped).log())#-2*(1/(255*opacity.squeeze(-1))).log()
-    #         axis_length=(coefficient*eigen_val.abs()).sqrt()
-    #         extension=(axis_length.unsqueeze(-2)*eigen_vec).abs().sum(dim=-3)
-
-    #         screen_uv=(ndc[:,:2]+1.0)*0.5
-    #         screen_uv[:,0]*=img_pixel_shape[1]#x
-    #         screen_uv[:,1]*=img_pixel_shape[0]#y
-    #         screen_coord=screen_uv-0.5
-    #         b_visible=~((ndc[:,0]<-1.3)|(ndc[:,0]>1.3)|(ndc[:,1]<-1.3)|(ndc[:,1]>1.3)|(ndc[:,2]>1)|(ndc[:,2]<0))
-
-    #         tile_h, tile_w = tile_size
-    #         # divisor must match [V,2,P]
-    #         tile_size_t = torch.tensor([tile_h, tile_w],
-    #                                 device=screen_coord.device,
-    #                                 dtype=screen_coord.dtype).view(1, 2, 1)
-    #         # mask must be [V,1,P]
-    #         b_visible_exp = b_visible.unsqueeze(1)
-    #         left_up = ((screen_coord - extension) / tile_size_t).floor().int() * b_visible_exp
-    #         right_down = ((screen_coord + extension) / tile_size_t).ceil().int() * b_visible_exp
-
-    #         left_up[:,0].clamp_(0,img_tile_shape[1])#x
-    #         left_up[:,1].clamp_(0,img_tile_shape[0])#y
-    #         right_down[:,0].clamp_(0,img_tile_shape[1])
-    #         right_down[:,1].clamp_(0,img_tile_shape[0])
-
-    #         return left_up,right_down
-        
-    #     nvtx.range_push("binning_allocate")
-    #     img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size[0]))),int(math.ceil(img_pixel_shape[1]/float(tile_size[1]))))
-    #     tiles_num=img_tile_shape[0]*img_tile_shape[1]
-
-    #     left_up,right_down=create_2d_AABB(ndc,eigen_val,eigen_vec,opacity,tile_size,img_pixel_shape,img_tile_shape)
-
-    #     #splatting area of each points
-    #     rect_length=right_down-left_up
-    #     tiles_touched=rect_length[:,0]*rect_length[:,1]
-    #     b_visible=(tiles_touched!=0)
-
-    #     #sort by depth
-    #     values,point_ids=ndc[:,2].sort(dim=-1,descending=True)
-    #     for i in range(ndc.shape[0]):
-    #         tiles_touched[i]=tiles_touched[i,point_ids[i]]
-
-    #     #calc the item num of table and the start index in table of each point
-    #     prefix_sum=tiles_touched.cumsum(1,dtype=torch.int32)#start index of points
-    #     total_tiles_num_batch=prefix_sum[:,-1]
-    #     allocate_size=total_tiles_num_batch.max().cpu()
-    #     nvtx.range_pop()
-        
-    #     # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
-    #     # large_points_index=(tiles_touched>=32).nonzero()
-    #     large_points_index = (tiles_touched >= 32).nonzero()
-
-    #     left_up = left_up.to(torch.int32)
-    #     right_down = right_down.to(torch.int32)
-    #     prefix_sum = prefix_sum.to(torch.int32)
-    #     point_ids = point_ids.to(torch.int32)
-    #     large_points_index = large_points_index.to(torch.int64)
-
-
-    #     print("left_up dtype =", left_up.dtype)
-    #     print("right_down dtype =", right_down.dtype)
-    #     print("prefix_sum dtype =", prefix_sum.dtype)
-    #     print("point_ids dtype =", point_ids.dtype)
-    #     print("large_points_index dtype =", large_points_index.dtype)
-
-
-    #     my_table=litegs_fused.create_table(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size), img_pixel_shape[0], img_pixel_shape[1], tile_size[0], tile_size[1])
-    #     sorted_tileId:torch.Tensor=my_table[0]
-    #     sorted_pointId:torch.Tensor=my_table[1]
-
-    #     # sort tile_id with torch.sort
-    #     # sorted_tileId,indices=torch.sort(tileId_table,dim=1,stable=True)
-    #     # sorted_pointId=pointId_table.gather(dim=1,index=indices)
-
-    #     # range
-    #     tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
-    #     return tile_start_index,sorted_pointId,b_visible
     @torch.no_grad()
-    def __binning_script(
-        ndc: torch.Tensor,
-        eigen_val: torch.Tensor,
-        eigen_vec: torch.Tensor,
-        opacity: torch.Tensor,
-        img_pixel_shape: tuple[int, int],
-        tile_size: tuple[int, int]
-    ):
-        """
-        Fully Python binning implementation.
-        Does NOT use any CUDA fused kernels.
-        Slow but correct.
-        """
+    def __binning_script(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,
+            img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
+        def craete_2d_AABB(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,tile_size:int,img_pixel_shape:tuple[int,int],img_tile_shape:tuple[int,int]):
+            # Major and minor axes -> AABB extensions
+            opacity_clamped=opacity.unsqueeze(0).clamp_min(1/255)
+            coefficient=2*((255*opacity_clamped).log())#-2*(1/(255*opacity.squeeze(-1))).log()
+            axis_length=(coefficient*eigen_val.abs()).sqrt()
+            extension=(axis_length.unsqueeze(-2)*eigen_vec).abs().sum(dim=-3)
 
-        V, P = ndc.shape[0], ndc.shape[2]
-        H, W = img_pixel_shape
-        tile_h, tile_w = tile_size
+            screen_uv=(ndc[:,:2]+1.0)*0.5
+            screen_uv[:,0]*=img_pixel_shape[1]#x
+            screen_uv[:,1]*=img_pixel_shape[0]#y
+            screen_coord=screen_uv-0.5
+            b_visible=~((ndc[:,0]<-1.3)|(ndc[:,0]>1.3)|(ndc[:,1]<-1.3)|(ndc[:,1]>1.3)|(ndc[:,2]>1)|(ndc[:,2]<0))
+            left_up=((screen_coord-extension)/tile_size).int()*b_visible
+            right_down=((screen_coord+extension)/tile_size).ceil().int()*b_visible
+            left_up[:,0].clamp_(0,img_tile_shape[1])#x
+            left_up[:,1].clamp_(0,img_tile_shape[0])#y
+            right_down[:,0].clamp_(0,img_tile_shape[1])
+            right_down[:,1].clamp_(0,img_tile_shape[0])
 
-        tiles_h = (H + tile_h - 1) // tile_h
-        tiles_w = (W + tile_w - 1) // tile_w
-        tiles_num = tiles_h * tiles_w
+            return left_up,right_down
+        
+        nvtx.range_push("binning_allocate")
+        img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size))),int(math.ceil(img_pixel_shape[1]/float(tile_size))))
+        tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
-        # ------------------------------------------------------------
-        # 1. Compute 2D Gaussian AABB (same as original script)
-        # ------------------------------------------------------------
-        opacity_clamped = opacity.unsqueeze(0).clamp_min(1/255)
-        coefficient = 2 * ((255 * opacity_clamped).log())
-        axis_len = (coefficient * eigen_val.abs()).sqrt()
-        extension = (axis_len.unsqueeze(-2) * eigen_vec).abs().sum(dim=-3)  # [V,2,P]
+        left_up,right_down=craete_2d_AABB(ndc,eigen_val,eigen_vec,opacity,tile_size,img_pixel_shape,img_tile_shape)
 
-        screen_uv = (ndc[:, :2] + 1.0) * 0.5
-        screen_uv[:, 0] *= W
-        screen_uv[:, 1] *= H
-        screen_coord = screen_uv - 0.5
+        #splatting area of each points
+        rect_length=right_down-left_up
+        tiles_touched=rect_length[:,0]*rect_length[:,1]
+        b_visible=(tiles_touched!=0)
 
-        b_visible = ~(
-            (ndc[:, 0] < -1.3) | (ndc[:, 0] > 1.3) |
-            (ndc[:, 1] < -1.3) | (ndc[:, 1] > 1.3) |
-            (ndc[:, 2] > 1)    | (ndc[:, 2] < 0)
-        )
+        #sort by depth
+        values,point_ids=ndc[:,2].sort(dim=-1,descending=True)
+        for i in range(ndc.shape[0]):
+            tiles_touched[i]=tiles_touched[i,point_ids[i]]
 
-        # Build divisors
-        tile_div = torch.tensor([tile_w, tile_h], device=ndc.device).view(1, 2, 1)
+        #calc the item num of table and the start index in table of each point
+        prefix_sum=tiles_touched.cumsum(1,dtype=torch.int32)#start index of points
+        total_tiles_num_batch=prefix_sum[:,-1]
+        allocate_size=total_tiles_num_batch.max().cpu()
+        nvtx.range_pop()
+        
+        # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
+        large_points_index=(tiles_touched>=32).nonzero()
+        my_table=litegs_fused.createTable(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size),img_tile_shape[1])
+        sorted_tileId:torch.Tensor=my_table[0]
+        sorted_pointId:torch.Tensor=my_table[1]
 
-        # Compute tile AABBs
-        left_up = ((screen_coord - extension) / tile_div).floor().int()
-        right_down = ((screen_coord + extension) / tile_div).ceil().int()
+        # sort tile_id with torch.sort
+        # sorted_tileId,indices=torch.sort(tileId_table,dim=1,stable=True)
+        # sorted_pointId=pointId_table.gather(dim=1,index=indices)
 
-        # Clamp
-        left_up[:, 0].clamp_(0, tiles_w)
-        left_up[:, 1].clamp_(0, tiles_h)
-        right_down[:, 0].clamp_(0, tiles_w)
-        right_down[:, 1].clamp_(0, tiles_h)
-
-        # Mask invisible
-        left_up *= b_visible.unsqueeze(1)
-        right_down *= b_visible.unsqueeze(1)
-
-        # ------------------------------------------------------------
-        # 2. Build full tile list for each point
-        # ------------------------------------------------------------
-        all_tile_ids = []
-        all_point_ids = []
-
-        for v in range(V):
-            for p in range(P):
-
-                if not b_visible[v, p]:
-                    continue
-
-                x0, y0 = left_up[v, :, p]
-                x1, y1 = right_down[v, :, p]
-
-                for ty in range(y0.item(), y1.item()):
-                    for tx in range(x0.item(), x1.item()):
-                        tile_id = ty * tiles_w + tx
-                        all_tile_ids.append(tile_id)
-                        all_point_ids.append(p)
-
-            # Convert to tensor per-view
-            if len(all_tile_ids) == 0:
-                tile_ids = torch.zeros((0,), dtype=torch.int32, device=ndc.device)
-                point_ids = torch.zeros((0,), dtype=torch.int32, device=ndc.device)
-            else:
-                tile_ids = torch.tensor(all_tile_ids, dtype=torch.int32, device=ndc.device)
-                point_ids = torch.tensor(all_point_ids, dtype=torch.int32, device=ndc.device)
-
-            # Sort by tile_id
-            sorted_idx = torch.argsort(tile_ids)
-            tile_ids = tile_ids[sorted_idx]
-            point_ids = point_ids[sorted_idx]
-
-            all_tile_ids = [tile_ids]    # keep one per view
-            all_point_ids = [point_ids]
-
-        tile_ids = all_tile_ids[0]
-        point_ids = all_point_ids[0]
-
-        # ------------------------------------------------------------
-        # 3. Build tile_start_index
-        # ------------------------------------------------------------
-        tile_start_index = torch.full(
-            (tiles_num + 1,),
-            fill_value=len(tile_ids),
-            dtype=torch.int32,
-            device=ndc.device
-        )
-
-        # compute offsets
-        current_tile = -1
-        for idx, tid in enumerate(tile_ids):
-            tid_int = int(tid.item())
-            if tile_start_index[tid_int] == len(tile_ids):
-                tile_start_index[tid_int] = idx
-
-        # fill gaps
-        last = len(tile_ids)
-        for t in reversed(range(tiles_num)):
-            if tile_start_index[t] == last:
-                tile_start_index[t] = last
-            else:
-                last = tile_start_index[t]
-        print("############# BINNING FINISHED #############")
-        return tile_start_index, point_ids, b_visible.sum(0)
-
+        # range
+        tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
+            
+        return tile_start_index,sorted_pointId,b_visible
     
     @torch.no_grad()
     def __binning_fused(ndc:torch.Tensor,view_depth:torch.Tensor,inv_cov2d:torch.Tensor,opacity:torch.Tensor,

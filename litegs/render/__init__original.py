@@ -45,7 +45,7 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
         camera_center=(-view_matrix[...,3:4,:3]@(view_matrix[...,:3,:3].transpose(-1,-2))).squeeze(1)
         dirs=culled_xyz[:3]-camera_center.unsqueeze(-1)
         dirs=torch.nn.functional.normalize(dirs,dim=-2)
-    color=utils.wrapper.SphericalHarmonicToRGB.call_script(actived_sh_degree,culled_sh_0,culled_sh_rest,dirs)
+    color=utils.wrapper.SphericalHarmonicToRGB.call_fused(actived_sh_degree,culled_sh_0,culled_sh_rest,dirs)
     nvtx.range_pop()
 
     return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
@@ -56,10 +56,10 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
 
     #gs projection
     nvtx.range_push("Proj")
-    transform_matrix=utils.wrapper.CreateTransformMatrix.call_script(scale,rot)
-    J=utils.wrapper.CreateRaySpaceTransformMatrix.call_script(xyz,view_matrix,proj_matrix,output_shape,False)#todo script
-    cov2d=utils.wrapper.CreateCov2dDirectly.call_script(J,view_matrix,transform_matrix)
-    eigen_val,eigen_vec,inv_cov2d=utils.wrapper.EighAndInverse2x2Matrix.call_script(cov2d)
+    transform_matrix=utils.wrapper.CreateTransformMatrix.call_fused(scale,rot)
+    J=utils.wrapper.CreateRaySpaceTransformMatrix.call_fused(xyz,view_matrix,proj_matrix,output_shape,False)#todo script
+    cov2d=utils.wrapper.CreateCov2dDirectly.call_fused(J,view_matrix,transform_matrix)
+    eigen_val,eigen_vec,inv_cov2d=utils.wrapper.EighAndInverse2x2Matrix.call_fused(cov2d)
     #ndc_pos=utils.wrapper.World2NdcFunc.apply(xyz,view_matrix@proj_matrix)
     hom_pos=(xyz.transpose(0,1)@(view_matrix@proj_matrix)).transpose(1,2).contiguous()
     ndc_pos=hom_pos/(hom_pos[:,3:4,:]+1e-7)
@@ -68,7 +68,7 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
     nvtx.range_pop()
     
     #visibility table
-    tile_start_index,sorted_pointId,primitive_visible=utils.wrapper.Binning.call_script(ndc_pos,view_depth,inv_cov2d,opacity,output_shape,pp.tile_size)
+    tile_start_index,sorted_pointId,primitive_visible=utils.wrapper.Binning.call_fused(ndc_pos,view_depth,inv_cov2d,opacity,output_shape,pp.tile_size)
 
     #raster
     tiles_x=int(math.ceil(output_shape[1]/float(pp.tile_size[1])))
