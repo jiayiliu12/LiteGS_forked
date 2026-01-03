@@ -64,7 +64,7 @@ class ModelParams(ParamGroup):
     _resolution = -1
     _white_background = False
     data_device = "cuda"
-    eval = False
+    eval = True # False CHANGED
 
 class PipelineParams(ParamGroup):
     cluster_size = 128
