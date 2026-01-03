@@ -638,9 +638,13 @@ class CreateViewProjFunc(torch.autograd.Function):
 
 class Binning(BaseWrapper):
     @torch.no_grad()
-    def __binning_script(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,
-            img_pixel_shape:tuple[int,int],tile_size:tuple[int,int]):
-        def craete_2d_AABB(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,tile_size:int,img_pixel_shape:tuple[int,int],img_tile_shape:tuple[int,int]):
+    def __binning_script(ndc: torch.Tensor,
+                     view_depth: torch.Tensor,      # kept but unused
+                     inv_cov2d: torch.Tensor,
+                     opacity: torch.Tensor,
+                     img_pixel_shape: tuple[int, int],
+                     tile_size: tuple[int, int]):
+        def craete_2d_AABB(ndc:torch.Tensor,eigen_val:torch.Tensor,eigen_vec:torch.Tensor,opacity:torch.Tensor,tile_size_x:int,tile_size_y:int,img_pixel_shape:tuple[int,int],img_tile_shape:tuple[int,int]):
             # Major and minor axes -> AABB extensions
             opacity_clamped=opacity.unsqueeze(0).clamp_min(1/255)
             coefficient=2*((255*opacity_clamped).log())#-2*(1/(255*opacity.squeeze(-1))).log()
@@ -652,8 +656,8 @@ class Binning(BaseWrapper):
             screen_uv[:,1]*=img_pixel_shape[0]#y
             screen_coord=screen_uv-0.5
             b_visible=~((ndc[:,0]<-1.3)|(ndc[:,0]>1.3)|(ndc[:,1]<-1.3)|(ndc[:,1]>1.3)|(ndc[:,2]>1)|(ndc[:,2]<0))
-            left_up=((screen_coord-extension)/tile_size).int()*b_visible
-            right_down=((screen_coord+extension)/tile_size).ceil().int()*b_visible
+            left_up=((screen_coord-extension)/tile_size_x).int()*b_visible
+            right_down=((screen_coord+extension)/tile_size_y).ceil().int()*b_visible
             left_up[:,0].clamp_(0,img_tile_shape[1])#x
             left_up[:,1].clamp_(0,img_tile_shape[0])#y
             right_down[:,0].clamp_(0,img_tile_shape[1])
@@ -661,11 +665,28 @@ class Binning(BaseWrapper):
 
             return left_up,right_down
         
+        inv_cov2d = inv_cov2d.permute(0, 3, 1, 2).contiguous()
+
         nvtx.range_push("binning_allocate")
-        img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size))),int(math.ceil(img_pixel_shape[1]/float(tile_size))))
+        img_tile_shape=(int(math.ceil(img_pixel_shape[0]/float(tile_size[0]))),int(math.ceil(img_pixel_shape[1]/float(tile_size[1]))))
         tiles_num=img_tile_shape[0]*img_tile_shape[1]
 
-        left_up,right_down=craete_2d_AABB(ndc,eigen_val,eigen_vec,opacity,tile_size,img_pixel_shape,img_tile_shape)
+        # inv_cov2d -> fake eigenvalues
+        a = inv_cov2d[:, :, 0, 0]  # -> [1, 66176]
+        c = inv_cov2d[:, :, 1, 1]  # -> [1, 66176]
+
+        fake_eigen_val = torch.stack([
+            1.0 / (a + 1e-8),
+            1.0 / (c + 1e-8)
+        ], dim=1)  # -> [B, 2, N]
+
+        # fake eigenvectors
+        B = ndc.shape[0]
+        N = ndc.shape[2]
+        eye = torch.eye(2, device=ndc.device).unsqueeze(0).unsqueeze(-1)
+        fake_eigen_vec = eye.expand(B, 2, 2, N).contiguous()
+
+        left_up,right_down=craete_2d_AABB(ndc,fake_eigen_val,fake_eigen_vec,opacity,tile_size[0],tile_size[1],img_pixel_shape,img_tile_shape)
 
         #splatting area of each points
         rect_length=right_down-left_up
@@ -685,17 +706,136 @@ class Binning(BaseWrapper):
         
         # allocate table and fill it (Table: tile_id-uint16,point_id-uint16)
         large_points_index=(tiles_touched>=32).nonzero()
-        my_table=litegs_fused.createTable(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size),img_tile_shape[1])
-        sorted_tileId:torch.Tensor=my_table[0]
-        sorted_pointId:torch.Tensor=my_table[1]
+        # my_table=litegs_fused.createTable(left_up,right_down,prefix_sum,point_ids,large_points_index,int(allocate_size),img_tile_shape[1])
 
-        # sort tile_id with torch.sort
-        # sorted_tileId,indices=torch.sort(tileId_table,dim=1,stable=True)
-        # sorted_pointId=pointId_table.gather(dim=1,index=indices)
+        def create_table_script_fast(left_up, right_down, point_ids, tiles_num, tiles_x,
+                             MAX_TILES_PER_POINT=64):
 
-        # range
-        tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
-            
+            B, _, N = left_up.shape
+
+            all_tile_ids = []
+            all_point_ids = []
+
+            for b in range(B):
+                lu = left_up[b]     # [2, N]
+                rd = right_down[b]  # [2, N]
+                pid_sorted = point_ids[b]
+
+                # Vectorized ranges per point
+                xs0 = lu[0]         # [N]
+                ys0 = lu[1]
+                xs1 = rd[0]
+                ys1 = rd[1]
+
+                # Compute tile counts per point
+                dx = (xs1 - xs0)    # [N]
+                dy = (ys1 - ys0)
+                tile_area = dx * dy
+
+                # Reorder AABB arrays by sorted depth order
+                xs0_sorted = xs0[pid_sorted]
+                ys0_sorted = ys0[pid_sorted]
+                xs1_sorted = xs1[pid_sorted]
+                ys1_sorted = ys1[pid_sorted]
+
+                dx_sorted = xs1_sorted - xs0_sorted
+                dy_sorted = ys1_sorted - ys0_sorted
+                tile_area_sorted = dx_sorted * dy_sorted
+
+                mask = (dx_sorted > 0) & (dy_sorted > 0) & (tile_area_sorted <= MAX_TILES_PER_POINT)
+
+                # Select valid subset
+                xs0_sel = xs0_sorted[mask]
+                ys0_sel = ys0_sorted[mask]
+                xs1_sel = xs1_sorted[mask]
+                ys1_sel = ys1_sorted[mask]
+                pid_sel = pid_sorted[mask]    # keeps correct point ID
+
+                for p, x0, y0, x1, y1 in zip(pid_sel.tolist(),
+                                            xs0_sel.tolist(),
+                                            ys0_sel.tolist(),
+                                            xs1_sel.tolist(),
+                                            ys1_sel.tolist()):
+                    # x1 > x0 guaranteed
+                    xs = torch.arange(x0, x1, device=left_up.device)
+                    ys = torch.arange(y0, y1, device=left_up.device)
+
+                    # Create grid of tiles → tensor operations (fast)
+                    grid_x, grid_y = torch.meshgrid(xs, ys, indexing='ij')
+                    tile_ids = grid_y * tiles_x + grid_x   # [dx, dy]
+
+                    all_tile_ids.append(tile_ids.reshape(-1))
+                    all_point_ids.append(torch.full((tile_ids.numel(),),
+                                                    p, dtype=torch.int32,
+                                                    device=left_up.device))
+
+            # Concatenate all tiles at once
+            if len(all_tile_ids) == 0:
+                return (torch.zeros(tiles_num+1, dtype=torch.int32, device=left_up.device),
+                        torch.zeros(0, dtype=torch.int32, device=left_up.device))
+
+            tile_ids = torch.cat(all_tile_ids)
+            point_ids_out = torch.cat(all_point_ids)
+
+            # Sort
+            sorted_tile_ids, sort_idx = torch.sort(tile_ids)
+            sorted_point_ids = point_ids_out[sort_idx]
+
+            # Compute tile ranges
+            tile_start = torch.full((tiles_num+1,),
+                                    sorted_tile_ids.numel(),
+                                    dtype=torch.int32, device=left_up.device)
+
+            uniq_tiles, counts = torch.unique_consecutive(sorted_tile_ids, return_counts=True)
+
+            offs = 0
+            for t, c in zip(uniq_tiles.tolist(), counts.tolist()):
+                tile_start[t] = offs
+                offs += c
+
+            return tile_start, sorted_point_ids
+
+        # my_table = litegs_fused.create_table(
+        #     ndc,
+        #     inv_cov2d,          # <-- you must pass inv_cov2d (add arg to function)
+        #     opacity,
+        #     prefix_sum,
+        #     point_ids,          # depth-sorted indices
+        #     int(allocate_size),
+        #     img_pixel_shape[0], # height
+        #     img_pixel_shape[1], # width
+        #     tile_size[0],       # tile_size_h
+        #     tile_size[1]        # tile_size_w
+        # )
+
+        tiles_x = img_tile_shape[1]
+        tiles_num = img_tile_shape[0] * img_tile_shape[1]
+
+        tile_start_index, sorted_pointId = create_table_script_fast(
+            left_up, right_down, point_ids, tiles_num, tiles_x
+        )
+        
+        # sorted_tileId:torch.Tensor=my_table[0]
+        # sorted_pointId:torch.Tensor=my_table[1]
+
+        # # sort tile_id with torch.sort
+        # # sorted_tileId,indices=torch.sort(tileId_table,dim=1,stable=True)
+        # # sorted_pointId=pointId_table.gather(dim=1,index=indices)
+
+        # print("\n=== DEBUG AFTER create_table ===")
+        # print("sorted_tileId shape=", sorted_tileId.shape)
+        # print("sorted_pointId shape=", sorted_pointId.shape)
+        # print("sorted_pointId min/max =", sorted_pointId.min().item(), "/", sorted_pointId.max().item(), 
+        #     "expected <", ndc.shape[2])
+        # # range
+        # tile_start_index=litegs_fused.tileRange(sorted_tileId,int(allocate_size),int(tiles_num-1+1))#max_tile_id:tilesnum-1, +1 for offset(tileId 0 is invalid)
+
+        # print("tile_start_index max =", tile_start_index.max().item(), 
+        #     "allocate_size =", allocate_size)
+        # print("sorted_tileId max =", sorted_tileId.max().item(), 
+        #     "tiles_num =", tiles_num)
+        # print("================================\n")            
+
         return tile_start_index,sorted_pointId,b_visible
     
     @torch.no_grad()
