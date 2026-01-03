@@ -9,6 +9,7 @@ import os
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 import json
+import wandb
 
 from .. import arguments
 from .. import data
@@ -26,6 +27,23 @@ def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
 
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
+    
+    wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
+
+    iter_start_whole = torch.cuda.Event(enable_timing=True)
+    iter_end_whole = torch.cuda.Event(enable_timing=True)
+
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
+
+    iter_start_render = torch.cuda.Event(enable_timing=True)
+    iter_end_render = torch.cuda.Event(enable_timing=True)
+
+    iter_start_backward = torch.cuda.Event(enable_timing=True)
+    iter_end_backward = torch.cuda.Event(enable_timing=True)
+
+    iter_start_dens = torch.cuda.Event(enable_timing=True)
+    iter_end_dens = torch.cuda.Event(enable_timing=True)
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
@@ -45,6 +63,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         else:
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
             test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+            # training_frames=[c for idx, c in enumerate(camera_frames) if idx >= len(camera_frames) / 10]
+            # test_frames=[c for idx, c in enumerate(camera_frames) if idx < len(camera_frames) / 10]
     else:
         training_frames=camera_frames
         test_frames=None
@@ -98,6 +118,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
+    #extend scope for wandb
+    # loss = 0
+    # l1_loss = 0
+    # psnr_mean = 0
+
     for epoch in range(start_epoch,total_epoch):
 
         with torch.no_grad():
@@ -108,7 +133,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
 
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,idx in train_loader:
+            for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
+                iter_start_whole.record()
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
@@ -148,7 +174,26 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.zero_grad()
                 schedular.step()
 
-        if epoch in test_epochs:
+                iter_end_whole.record()
+
+                wandb.log({
+                    "train/total_loss": loss.item(),
+                    "train/L1": l1_loss.item(),
+                    # "train/PSNR": float(psnr_mean),
+                    "gaussians/count": xyz.shape[1] * xyz.shape[2],
+                    
+                    # "time/train [ms]": train_time,
+                    "time/iter_time_forward_backward_&_no_grad_part (whole iteration) [ms]": iter_start_whole.elapsed_time(iter_end_whole),
+                    # "time/iter_time_forward_backward [ms]": iter_time,
+                    # "time/iter_time_forward [ms]": iter_render_time,
+                    # "time/iter_time_backward [ms]": iter_backward_time,
+                    # "time/iter_time_densification [ms]": iter_time_dens,
+                    # "time/prune [ms]": prune_time,
+                }, step = epoch * total_epoch + i)
+
+
+        # if epoch in test_epochs:
+        if lp.eval:
             with torch.no_grad():
                 _cluster_origin=None
                 _cluster_extend=None
@@ -182,7 +227,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
+                    psnr_mean = torch.concat(psnr_list,dim=0).mean()
+                    # wandb.log({
+                    #     "psnr_mean" ; psnr_mean.item(),
+
+                    # }, epoch)
+                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
         progress_bar.update()  
