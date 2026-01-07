@@ -10,6 +10,7 @@ import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 import json
 import wandb
+import torch.cuda.profiler as profiler
 
 from .. import arguments
 from .. import data
@@ -30,20 +31,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     
     wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
 
-    iter_start_whole = torch.cuda.Event(enable_timing=True)
-    iter_end_whole = torch.cuda.Event(enable_timing=True)
-
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
-
-    iter_start_render = torch.cuda.Event(enable_timing=True)
-    iter_end_render = torch.cuda.Event(enable_timing=True)
-
-    iter_start_backward = torch.cuda.Event(enable_timing=True)
-    iter_end_backward = torch.cuda.Event(enable_timing=True)
-
-    iter_start_dens = torch.cuda.Event(enable_timing=True)
-    iter_end_dens = torch.cuda.Event(enable_timing=True)
+    densification_pruning_start = torch.cuda.Event(enable_timing=True)
+    densification_pruning_end = torch.cuda.Event(enable_timing=True)
+    backward_start = torch.cuda.Event(enable_timing=True)
+    backward_end = torch.cuda.Event(enable_timing=True)
+    preprocess_start = torch.cuda.Event(enable_timing=True)
+    preprocess_end = torch.cuda.Event(enable_timing=True)
+    total_iteration_start = torch.cuda.Event(enable_timing=True)
+    total_iteration_end = torch.cuda.Event(enable_timing=True)
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
@@ -118,10 +113,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
-    #extend scope for wandb
-    # loss = 0
-    # l1_loss = 0
-    # psnr_mean = 0
+    #variables for wandb
+    iteration = 0
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -134,7 +127,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
-                iter_start_whole.record()
+                total_iteration_start.record()
+
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
@@ -148,18 +142,34 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
                 nvtx.range_pop()
 
+                # if iteration == 100: 
+                #     profiler.start()
+                #     print("!!! Profiling Started !!!")
+
                 #cluster culling
+                preprocess_start.record()
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                preprocess_end.record()
+
+                img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                             actived_sh_degree,gt_image.shape[2:],pp)
-                
+                                                            
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
                 loss+=(culled_scale).square().mean()*op.reg_weight
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
+
+                backward_start.record()
                 loss.backward()
+                backward_end.record()
+
+                # if iteration >= 101:
+                #     profiler.stop()
+                #     print("!!! Profiling Finished !!!")
+                #     break
+
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
                 if pp.sparse_grad:
@@ -173,27 +183,31 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.step()
                     # proj_opt.zero_grad()
                 schedular.step()
-
-                iter_end_whole.record()
+                total_iteration_end.record()
+                total_iteration_end.synchronize()
 
                 wandb.log({
                     "train/total_loss": loss.item(),
                     "train/L1": l1_loss.item(),
-                    # "train/PSNR": float(psnr_mean),
                     "gaussians/count": xyz.shape[1] * xyz.shape[2],
                     
                     # "time/train [ms]": train_time,
-                    "time/iter_time_forward_backward_&_no_grad_part (whole iteration) [ms]": iter_start_whole.elapsed_time(iter_end_whole),
-                    # "time/iter_time_forward_backward [ms]": iter_time,
-                    # "time/iter_time_forward [ms]": iter_render_time,
-                    # "time/iter_time_backward [ms]": iter_backward_time,
-                    # "time/iter_time_densification [ms]": iter_time_dens,
-                    # "time/prune [ms]": prune_time,
-                }, step = epoch * total_epoch + i)
+                    "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
+                    "time/backward [ms]": backward_start.elapsed_time(backward_end),
+                    "time/total_iteration [ms]": total_iteration_start.elapsed_time(total_iteration_end),
+                    "time/render [ms]": elapsed_times["render_time"],
+                    "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
+                    "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
+                    "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
+                    "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
+                    "time/render/Binning [ms]": elapsed_times["Binning_time"],
+                    "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
+                }, iteration)
+                iteration += 1
 
 
-        # if epoch in test_epochs:
-        if lp.eval:
+        if epoch in test_epochs:
+        # if lp.eval:
             with torch.no_grad():
                 _cluster_origin=None
                 _cluster_extend=None
@@ -204,7 +218,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if lp.eval:
                     loaders["Testset"]=test_loader
                 for name,loader in loaders.items():
+                    l1_loss_test_list=[]
                     psnr_list=[]
+                    ssim_list=[]
                     for view_matrix,proj_matrix,frustumplane,gt_image,idx in loader:
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
@@ -224,18 +240,33 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
                         #cluster culling
                         visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                        img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                        img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
+                        l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
-                    psnr_mean = torch.concat(psnr_list,dim=0).mean()
-                    # wandb.log({
-                    #     "psnr_mean" ; psnr_mean.item(),
+                        ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
+                    l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
+                    psnr_mean=torch.concat(psnr_list,dim=0).mean()
+                    ssim_mean=torch.concat(ssim_list,dim=0).mean()
 
-                    # }, epoch)
+                    wandb.log({
+                        f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
+                        f"test/psnr_{name}" : psnr_mean.item(),
+                        f"test/ssim_{name}" : ssim_mean.item()
+                    }, iteration)
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
+        densification_pruning_start.record()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
+        densification_pruning_end.record()
+        
         progress_bar.update()  
+
+        densification_pruning_end.synchronize()
+
+        wandb.log({
+            f"time/densification_pruning" : densification_pruning_start.elapsed_time(densification_pruning_end),
+        }, iteration)
 
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:

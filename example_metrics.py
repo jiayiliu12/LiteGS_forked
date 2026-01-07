@@ -124,7 +124,7 @@ if __name__ == "__main__":
 
                 #cluster culling
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=litegs.render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,lp.sh_degree)
-                img,transmitance,depth,normal,primitive_visible=litegs.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                img,transmitance,depth,normal,primitive_visible,_=litegs.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                             lp.sh_degree,gt_image.shape[2:],pp)
                 psnr_value=psnr_metrics(img,gt_image)
                 ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))

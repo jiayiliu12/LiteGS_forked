@@ -54,12 +54,32 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,color:torch.Tensor,opacity:torch.Tensor,
            actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
 
+    #profile each function
+    render_start = torch.cuda.Event(enable_timing=True)
+    render_end = torch.cuda.Event(enable_timing=True)
+    CreateTransformMatrix_start = torch.cuda.Event(enable_timing=True)
+    CreateRaySpaceTransformMatrix_start = torch.cuda.Event(enable_timing=True)
+    CreateCov2dDirectly_start = torch.cuda.Event(enable_timing=True)
+    EighAndInverse2x2Matrix_start = torch.cuda.Event(enable_timing=True)
+    EighAndInverse2x2Matrix_end = torch.cuda.Event(enable_timing=True)
+    Binning_start = torch.cuda.Event(enable_timing=True)
+    Binning_end = torch.cuda.Event(enable_timing=True)
+    GaussiansRasterFunc_start = torch.cuda.Event(enable_timing=True)
+    GaussiansRasterFunc_end = torch.cuda.Event(enable_timing=True)
+
+    render_start.record()
+
     #gs projection
     nvtx.range_push("Proj")
+    CreateTransformMatrix_start.record()
     transform_matrix=utils.wrapper.CreateTransformMatrix.call_fused(scale,rot)
+    CreateRaySpaceTransformMatrix_start.record()
     J=utils.wrapper.CreateRaySpaceTransformMatrix.call_fused(xyz,view_matrix,proj_matrix,output_shape,False)#todo script
+    CreateCov2dDirectly_start.record()
     cov2d=utils.wrapper.CreateCov2dDirectly.call_fused(J,view_matrix,transform_matrix)
+    EighAndInverse2x2Matrix_start.record()
     eigen_val,eigen_vec,inv_cov2d=utils.wrapper.EighAndInverse2x2Matrix.call_fused(cov2d)
+    EighAndInverse2x2Matrix_end.record()
     #ndc_pos=utils.wrapper.World2NdcFunc.apply(xyz,view_matrix@proj_matrix)
     hom_pos=(xyz.transpose(0,1)@(view_matrix@proj_matrix)).transpose(1,2).contiguous()
     ndc_pos=hom_pos/(hom_pos[:,3:4,:]+1e-7)
@@ -68,7 +88,9 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
     nvtx.range_pop()
     
     #visibility table
+    Binning_start.record()
     tile_start_index,sorted_pointId,primitive_visible=utils.wrapper.Binning.call_fused(ndc_pos,view_depth,inv_cov2d,opacity,output_shape,pp.tile_size)
+    Binning_end.record()
 
     #raster
     tiles_x=int(math.ceil(output_shape[1]/float(pp.tile_size[1])))
@@ -78,9 +100,12 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
         tiles=StatisticsHelperInst.cached_sorted_tile_list[StatisticsHelperInst.cur_sample].unsqueeze(0)
     except:
         pass
+
+    GaussiansRasterFunc_start.record()
     img,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,tiles,
                                             output_shape[0],output_shape[1],pp.tile_size[0],pp.tile_size[1],pp.enable_transmitance,pp.enable_depth)
-    
+    GaussiansRasterFunc_end.record()
+
     if StatisticsHelperInst.bStart:
         StatisticsHelperInst.update_tile_blend_count(lst_contributor)
 
@@ -92,4 +117,21 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
         depth=utils.tiles2img_torch(depth,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
     if normal is not None:
         normal=utils.tiles2img_torch(normal,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
-    return img,transmitance,depth,normal,primitive_visible
+
+    render_end.record()
+        
+    render_end.synchronize()
+
+    CreateTransformMatrix_time=CreateTransformMatrix_start.elapsed_time(CreateRaySpaceTransformMatrix_start)
+    CreateRaySpaceTransformMatrix_time=CreateRaySpaceTransformMatrix_start.elapsed_time(CreateCov2dDirectly_start)
+    CreateCov2dDirectly_time=CreateCov2dDirectly_start.elapsed_time(EighAndInverse2x2Matrix_start)
+    EighAndInverse2x2Matrix_time=EighAndInverse2x2Matrix_start.elapsed_time(EighAndInverse2x2Matrix_end)
+    Binning_time=Binning_start.elapsed_time(Binning_end)
+    GaussiansRasterFunc_time=GaussiansRasterFunc_start.elapsed_time(GaussiansRasterFunc_end)
+    render_time=render_start.elapsed_time(render_end)
+
+    elapsed_times = {"CreateTransformMatrix_time":CreateTransformMatrix_time,"CreateRaySpaceTransformMatrix_time":CreateRaySpaceTransformMatrix_time,
+                     "CreateCov2dDirectly_time":CreateCov2dDirectly_time, "EighAndInverse2x2Matrix_time":EighAndInverse2x2Matrix_time,
+                     "Binning_time":Binning_time,"GaussiansRasterFunc_time":GaussiansRasterFunc_time,"render_time":render_time}
+
+    return img,transmitance,depth,normal,primitive_visible,elapsed_times
