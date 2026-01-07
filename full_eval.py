@@ -93,28 +93,30 @@ img_folder={
 }
 
 custom_config={
-    "mipnerf360_indoor":"  ",
-    "mipnerf360_outdoor":"  ",
-    "tanksandtemples":" --iterations 40000 --position_lr_max_steps 40000 ",#follow 3d student splatting and scooping
-    "deepblending":"  ",
+    "mipnerf360_indoor":" ",
+    "mipnerf360_outdoor":" ",
+    "tanksandtemples":" --iterations 40000 --position_lr_max_steps 40000",#follow 3d student splatting and scooping
+    "deepblending":" ",
 }
 
-training_args_tempalte="-s {0} -m {1} --eval --sh_degree 3 --target_primitives {2} -i {3} "
+training_args_tempalte="-s {0} -m {1} --eval --sh_degree 3 --target_primitives {2} -i {3}"
 eval_args_template="-s {0} -m {1} --sh_degree 3 -i {2} --eval"
 take_time_pattern = r"takes:\s*([+-]?\d+(?:\.\d+)?)"
 eval_pattern = r"(SSIM|PSNR|LPIPS)\s*:\s*([+-]?\d+(?:\.\d+)?)"
-csv_header=["scene","primitives","takes","SSIM_train","PSNRtrain","LPIPS_train","SSIM_test","PSNR_test","LPIPS_test"]
+csv_header=["scene","primitives","takes","SSIM_train","PSNR_train","LPIPS_train","SSIM_test","PSNR_test","LPIPS_test"]
 results={}
 
 if not args.skip_training:
     for dataset,scenes in datasets.items():
         for scene_name in scenes:
             scene_input_path=os.path.join(args.__getattribute__(dataset.split('_')[0]),scene_name)
+            results[scene_name]={}
             #curve
             for target_primitives in target_primitives_list[scene_name]:
                 results[scene_name][target_primitives]={}
                 scene_output_path=os.path.join(args.output_path,scene_name+'-{}k'.format(int(target_primitives/1000)))
                 print("scene:{} #primitive:{}".format(scene_name,target_primitives))
+                
                 training_args=training_args_tempalte.format(scene_input_path,scene_output_path,target_primitives,img_folder[dataset])
                 process = subprocess.Popen(["python","example_train.py"]+training_args.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 stdout, stderr = process.communicate()
@@ -128,7 +130,7 @@ if not args.skip_training:
             results[scene_name][target_primitives]={}
             scene_output_path=os.path.join(args.output_path,scene_name+'-{}k'.format(int(target_primitives/1000)))
             print("scene:{} #primitive:{}".format(scene_name,target_primitives))
-            training_args=training_args_tempalte.format(scene_input_path,scene_output_path,target_primitives,img_folder[dataset])+custom_config[dataset]
+            training_args=training_args_tempalte.format(scene_input_path,scene_output_path,target_primitives,img_folder[dataset])#+custom_config[dataset]
             process = subprocess.Popen(["python","example_train.py"]+training_args.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate()
             print(stderr)
