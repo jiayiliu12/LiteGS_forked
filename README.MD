@@ -52,7 +52,7 @@ Gaussian splatting is a powerful technique used in various computer graphics and
 2. Install fused-ssim
 
     ```bash
-    pip install litegs/submodules/fussed_ssim
+    pip install litegs/submodules/fused_ssim
     ```
     
 
