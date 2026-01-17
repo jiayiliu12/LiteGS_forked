@@ -10,6 +10,8 @@ from .. import scene
 
 from litegs.render.rasterizer_pytorch import rasterize_pytorch_view
 
+# __init__pytorchrasterizer.py
+
 def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tensor|None,frustumplane:torch.Tensor,view_matrix:torch.Tensor,
                       xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,sh_0:torch.Tensor,sh_rest:torch.Tensor,opacity:torch.Tensor,
                       op:arguments.OptimizationParams,pp:arguments.PipelineParams,actived_sh_degree:int):
