@@ -57,9 +57,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 test_frames=[c for c in camera_frames if c.name in train_test_split["test"]]
         else:
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-            test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
-            # training_frames=[c for idx, c in enumerate(camera_frames) if idx >= len(camera_frames) / 10]
-            # test_frames=[c for idx, c in enumerate(camera_frames) if idx < len(camera_frames) / 10]
+            # test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+            test_frames = [camera_frames[idx] for idx in range(0, 40, 8)] # ensures 5 testing imgs, which are idx % 8
     else:
         training_frames=camera_frames
         test_frames=None
@@ -142,10 +141,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
                 nvtx.range_pop()
 
-                # if iteration == 100: 
-                #     profiler.start()
-                #     print("!!! Profiling Started !!!")
-
                 #cluster culling
                 preprocess_start.record()
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
@@ -164,11 +159,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 backward_start.record()
                 loss.backward()
                 backward_end.record()
-
-                # if iteration >= 101:
-                #     profiler.stop()
-                #     print("!!! Profiling Finished !!!")
-                #     break
 
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -206,7 +196,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 iteration += 1
 
 
-        if epoch in test_epochs:
+        if epoch in test_epochs or epoch==total_epoch-1:
         # if lp.eval:
             with torch.no_grad():
                 _cluster_origin=None
@@ -257,9 +247,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         densification_pruning_start.record()
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
+        # prune(train_loader,0.80,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,train_loader,actived_sh_degree,op,pp)
+        # prune(train_loader,0.30,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
         densification_pruning_end.record()
-        
+
         progress_bar.update()  
 
         densification_pruning_end.synchronize()

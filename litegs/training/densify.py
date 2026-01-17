@@ -7,6 +7,10 @@ from ..utils import qvec2rotmat
 from ..scene import cluster
 from ..utils import wrapper
 
+import sys
+from .. import render
+import tqdm
+
 class DensityControllerBase:
     def __init__(self,densify_params:DensifyParams,bCluster:bool) -> None:
         self.densify_params=densify_params
@@ -134,8 +138,61 @@ class DensityControllerOfficial(DensityControllerBase):
         selected_pts_mask=abnormal_mask&large_pts_mask
         return selected_pts_mask
     
+
+    @torch.no_grad() 
+    def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,import_score):
+        sorted_tensor, _ = torch.sort(import_score, dim=0)
+        index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
+        value_nth_percentile = sorted_tensor[index_nth_percentile]
+        prune_mask = (import_score <= value_nth_percentile).squeeze()
+        return prune_mask
+
+    # @torch.no_grad() # TODO: maybe enable grad????
+    def score_func_(self,view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer:torch.optim.Optimizer,actived_sh_degree,op,pp):
+        img_scores = torch.zeros_like(scores)
+        img_scores.requires_grad = True
+        cluster_origin=None
+        cluster_extend=None
+        xyz,scale,rot,sh_0,sh_rest,opacity = self._get_params_from_optimizer(optimizer)
+
+        _,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                                                    actived_sh_degree,gt_image.shape[2:],pp)
+        img.sum().backward()
+        scores += img_scores.grad
+        return scores
+
+    @torch.no_grad() # TODO: maybe enable grad????
+    def prune_(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
+        # start_prune.record()
+        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+
+        with torch.enable_grad():
+            scores = torch.zeros_like(opacity) # one score for each Gaussian in the model!
+            for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
+                self.score_func_(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
+        
+        chunk_size = 1
+        if self.bCluster:
+            chunk_size=xyz.shape[-1]
+            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+
+        prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,scores)
+        if prune_mask.sum()>0.9*opacity.shape[1]:
+            assert(False)
+        if self.bCluster:
+            N=prune_mask.sum()
+            chunk_num=int(N/chunk_size)
+            del_limit=chunk_num*chunk_size
+            del_indices=prune_mask.nonzero()[:del_limit,0]
+            prune_mask=torch.zeros_like(prune_mask)
+            prune_mask[del_indices]=True
+        self._prune_optimizer(~prune_mask,optimizer)
+        return
+
+    
     @torch.no_grad()
-    def prune(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def prune(self,optimizer:torch.optim.Optimizer):
         
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         if self.bCluster:
@@ -154,6 +211,17 @@ class DensityControllerOfficial(DensityControllerBase):
             prune_mask[del_indices]=True
         #print("\n #prune:{0} #points:{1}".format(prune_mask.sum(),(~prune_mask).sum()))
         self._prune_optimizer(~prune_mask,optimizer)
+        # for g in optimizer.param_groups:
+        #     p = g["params"][0]
+        #     print(g["name"], p.shape)
+        # sys.exit()
+
+        # xyz torch.Size([3, 665, 128])
+        # sh_0 torch.Size([1, 3, 665, 128])
+        # sh_rest torch.Size([15, 3, 665, 128])
+        # opacity torch.Size([1, 665, 128])
+        # scale torch.Size([3, 665, 128])
+        # rot torch.Size([4, 665, 128])
         return
 
     @torch.no_grad()
@@ -243,12 +311,13 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
                 self.split_and_clone(optimizer,epoch)
-                self.prune(optimizer,epoch)
+                self.prune(optimizer)
+                dictio = self.prune_(optimizer,0.3,train_loader,actived_sh_degree,op,pp)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
                 self.reset_opacity(optimizer,epoch)
