@@ -12,17 +12,23 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
                       xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,sh_0:torch.Tensor,sh_rest:torch.Tensor,opacity:torch.Tensor,
                       op:arguments.OptimizationParams,pp:arguments.PipelineParams,actived_sh_degree:int):
 
-    if pp.cluster_size:
+    culled_idx=None
+    if pp.cluster_size: # cluster_size = 128
         if cluster_origin is None or cluster_extend is None:
             cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
 
-        if pp.sparse_grad:#enable sparse gradient
+        if pp.sparse_grad: # sparse_grad = True
             visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity=utils.wrapper.CullCompactActivateWithSparseGrad.apply(
                 cluster_origin,cluster_extend,frustumplane,view_matrix,actived_sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity)
+
+            # compute indices BEFORE uncluster (still chunk-level ids)
+            ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
+            culled_idx = (visible_chunkid.long().unsqueeze(-1) * pp.cluster_size + ar).reshape(-1)
+
             culled_xyz,culled_scale,culled_rot,color,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity)  
             if StatisticsHelperInst.bStart:
                 StatisticsHelperInst.set_compact_mask(visible_chunkid)
-            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
+            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_idx
         else:
             visibility,visible_num,visible_chunkid=utils.wrapper.litegs_fused.frustum_culling_aabb_cuda(cluster_origin,cluster_extend,frustumplane)
             visible_chunkid=visible_chunkid[:visible_num]
@@ -48,11 +54,11 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
     color=utils.wrapper.SphericalHarmonicToRGB.call_fused(actived_sh_degree,culled_sh_0,culled_sh_rest,dirs)
     nvtx.range_pop()
 
-    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
+    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_idx
 
 def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,color:torch.Tensor,opacity:torch.Tensor,
-           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams,scores=None)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
 
     #profile each function
     render_start = torch.cuda.Event(enable_timing=True)
@@ -102,7 +108,7 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
         pass
 
     GaussiansRasterFunc_start.record()
-    img,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,tiles,
+    img,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,tiles,scores,
                                             output_shape[0],output_shape[1],pp.tile_size[0],pp.tile_size[1],pp.enable_transmitance,pp.enable_depth)
     GaussiansRasterFunc_end.record()
 

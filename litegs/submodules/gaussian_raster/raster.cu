@@ -597,6 +597,7 @@ __global__ void raster_backward_kernel(
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> packed_grad,         //[batch,point_num,9]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> out_err_sum,  //[batch,1,point_num]
     torch::PackedTensorAccessor32<float, 3, torch::RestrictPtrTraits> out_err_square_sum,  //[batch,1,point_num]
+    torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> out_dG2,  //[batch,point_num]
     int tiles_num_x, int img_h, int img_w)
 {
     constexpr int VECTOR_SIZE = 2;
@@ -752,6 +753,12 @@ __global__ void raster_backward_kernel(
 
                         grad_a += d_alpha * G;
                         half2 d_G = point_color_x2.a * d_alpha;
+
+                        // NEW: pruning score accumulation
+                        float dg0 = (float)d_G.x * INV_SCALER;
+                        float dg1 = (float)d_G.y * INV_SCALER;
+                        atomicAdd(&out_dG2[batch_id][point_id], dg0 * dg0 + dg1 * dg1);
+
                         half2 d_power = G * d_G;//G * point_alpha * d_alpha
                         if (enable_statistic)
                         {
@@ -874,6 +881,7 @@ d_depth_img.packed_accessor32<float, 5, torch::RestrictPtrTraits>(),\
 packed_grad.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),\
 err_sum.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
 err_square_sum.packed_accessor32<float, 3, torch::RestrictPtrTraits >(),\
+dG2.packed_accessor32<float, 2, torch::RestrictPtrTraits >(),\
 tilesnum_x, img_h, img_w
 
 #define LAUNCH_RASTER_BACKWARD_KERNEL(TILE_H, TILE_W, STATISTIC, TRANS, DEPTH) \
@@ -959,6 +967,7 @@ std::vector<at::Tensor> rasterize_backward(
     at::Tensor packed_grad = torch::zeros({ batch_num,points_num,sizeof(PackedGrad)/sizeof(float)}, packed_params.options());
     at::Tensor err_square_sum = torch::zeros({ batch_num,1,points_num }, packed_params.options());
     at::Tensor err_sum = torch::zeros({ batch_num,1,points_num }, packed_params.options());
+    at::Tensor dG2 = torch::zeros({ batch_num,points_num }, packed_params.options()); // gradient of scores
     
     int tiles_per_block = 4;
     dim3 Block3d(std::ceil(render_tile_num / float(tiles_per_block)), viewsnum, 1);
@@ -1006,5 +1015,5 @@ std::vector<at::Tensor> rasterize_backward(
         d_opacity.packed_accessor32<float, 2, torch::RestrictPtrTraits >());
     CUDA_CHECK_ERRORS;
 
-    return { d_ndc ,d_cov2d_inv ,d_color,d_opacity,err_sum,err_square_sum };
+    return { d_ndc ,d_cov2d_inv ,d_color,d_opacity,err_sum,err_square_sum,dG2 };
 }

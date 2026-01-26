@@ -18,8 +18,8 @@ class DensityControllerBase:
         return
     
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int):
-        return
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
+        return self._get_params_from_optimizer(optimizer)
     
     @torch.no_grad()
     def _get_params_from_optimizer(self,optimizer:torch.optim.Optimizer)->list[torch.Tensor]:
@@ -138,48 +138,81 @@ class DensityControllerOfficial(DensityControllerBase):
         selected_pts_mask=abnormal_mask&large_pts_mask
         return selected_pts_mask
     
-
-    @torch.no_grad() 
-    def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,import_score):
-        sorted_tensor, _ = torch.sort(import_score, dim=0)
-        index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
-        value_nth_percentile = sorted_tensor[index_nth_percentile]
-        prune_mask = (import_score <= value_nth_percentile).squeeze()
-        return prune_mask
-
-    # @torch.no_grad() # TODO: maybe enable grad????
-    def score_func_(self,view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer:torch.optim.Optimizer,actived_sh_degree,op,pp):
-        img_scores = torch.zeros_like(scores)
-        img_scores.requires_grad = True
+    # Grad is enabled
+    def score_func_speedysplat(self,view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer:torch.optim.Optimizer,actived_sh_degree,op,pp):
+        
+        # Set these to None so that they are initialized in the render_preprocess() function
         cluster_origin=None
         cluster_extend=None
+
+        # Get clustered params to calculate the score
         xyz,scale,rot,sh_0,sh_rest,opacity = self._get_params_from_optimizer(optimizer)
 
-        _,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        _,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_idx=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+
+        img_scores = torch.zeros((1, culled_opacity.numel()), # Shape [B,N_culled] with B=1, according to what CUDA expects
+                                device=culled_opacity.device,
+                                dtype=culled_opacity.dtype,
+                                requires_grad=True).contiguous()
+
+        # print("view_matrix", view_matrix.shape) -> view_matrix torch.Size([1, 4, 4])
+        # print("proj_matrix", proj_matrix.shape) -> proj_matrix torch.Size([1, 4, 4])
+        # print("frustumplane", frustumplane.shape) -> frustumplane torch.Size([1, 6, 4])
+
         img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                    actived_sh_degree,gt_image.shape[2:],pp)
-        img.sum().backward()
-        scores += img_scores.grad
-        return scores
+                                                    actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
+        if not torch.isfinite(img).all():
+            raise RuntimeError("img has NaN/Inf BEFORE backward")
 
-    @torch.no_grad() # TODO: maybe enable grad????
-    def prune_(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
-        # start_prune.record()
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-
+        try:
+            img.sum().backward()
+        except RuntimeError as e:
+            raise
+        else:
+            if img_scores.grad is None:
+                raise RuntimeError("no grad for img_scores")
+            if not torch.isfinite(img_scores.grad).all():
+                raise RuntimeError("img_scores.grad has NaN/Inf")
+            
+        scores.index_add_(0,culled_idx,img_scores.grad.reshape(-1)) # img_scores.grad: Shape [1,N_culled], scores: Shape [N]
+        return scores # Shape [N]
+    
+    def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,opacity,train_loader,actived_sh_degree,op,pp):
+        # All model params are unclustered here
         with torch.enable_grad():
-            scores = torch.zeros_like(opacity) # one score for each Gaussian in the model!
+            scores = torch.zeros_like(opacity.reshape(-1)) # one score for each Gaussian in the model! -> shape [N]
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
-                self.score_func_(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
-        
+                # Get scores param
+                self.score_func_speedysplat(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
+
+        sorted_tensor, _ = torch.sort(scores)
+        index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
+        value_nth_percentile = sorted_tensor[index_nth_percentile]
+        # scores[scores==0] = 1 # TODO: Don't prune the Gaussians that were not scored???
+        prune_mask = ((scores <= value_nth_percentile))  # [N] bool
+        return prune_mask # Must have shape [N]
+
+    # prune_speedysplat() is the same function as prune() below, just with a different prune_mask
+    @torch.no_grad()
+    def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
+
+        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         chunk_size = 1
         if self.bCluster:
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+            # xyz torch.Size([3, N])
+            # sh_0 torch.Size([1, 3, N])
+            # sh_rest torch.Size([15, 3, N])
+            # opacity torch.Size([1, N])
+            # scale torch.Size([3, N])
+            # rot torch.Size([4, N])
 
-        prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,scores)
-        if prune_mask.sum()>0.9*opacity.shape[1]:
-            assert(False)
+        # prune_mask: shape [N]
+        prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,opacity,train_loader,actived_sh_degree,op,pp) 
+
+        if prune_mask.sum() > 0.9 * opacity.shape[1]:
+            raise RuntimeError("Pruning would remove >90% of Gaussians")
         if self.bCluster:
             N=prune_mask.sum()
             chunk_num=int(N/chunk_size)
@@ -189,8 +222,19 @@ class DensityControllerOfficial(DensityControllerBase):
             prune_mask[del_indices]=True
         self._prune_optimizer(~prune_mask,optimizer)
         return
-
     
+    # for g in optimizer.param_groups:
+    #     p = g["params"][0]
+    #     print(g["name"], p.shape)
+    # sys.exit()
+
+    # xyz torch.Size([3, 665, 128])
+    # sh_0 torch.Size([1, 3, 665, 128])
+    # sh_rest torch.Size([15, 3, 665, 128])
+    # opacity torch.Size([1, 665, 128])
+    # scale torch.Size([3, 665, 128])
+    # rot torch.Size([4, 665, 128])
+
     @torch.no_grad()
     def prune(self,optimizer:torch.optim.Optimizer):
         
@@ -211,17 +255,6 @@ class DensityControllerOfficial(DensityControllerBase):
             prune_mask[del_indices]=True
         #print("\n #prune:{0} #points:{1}".format(prune_mask.sum(),(~prune_mask).sum()))
         self._prune_optimizer(~prune_mask,optimizer)
-        # for g in optimizer.param_groups:
-        #     p = g["params"][0]
-        #     print(g["name"], p.shape)
-        # sys.exit()
-
-        # xyz torch.Size([3, 665, 128])
-        # sh_0 torch.Size([1, 3, 665, 128])
-        # sh_rest torch.Size([15, 3, 665, 128])
-        # opacity torch.Size([1, 665, 128])
-        # scale torch.Size([3, 665, 128])
-        # rot torch.Size([4, 665, 128])
         return
 
     @torch.no_grad()
@@ -317,7 +350,8 @@ class DensityControllerOfficial(DensityControllerBase):
             if epoch%self.densify_params.densification_interval==0:
                 self.split_and_clone(optimizer,epoch)
                 self.prune(optimizer)
-                dictio = self.prune_(optimizer,0.3,train_loader,actived_sh_degree,op,pp)
+                # Speedy-Splat pruning: Prune 10% of all Gaussians
+                self.prune_speedysplat(optimizer,0.1,train_loader,actived_sh_degree,op,pp)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
                 self.reset_opacity(optimizer,epoch)
@@ -340,7 +374,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
     
     @torch.no_grad()
     def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
-        if self.densify_params.prune_mode == 'weight':
+        if self.densify_params.prune_mode == 'weight': # LiteGS uses 'weight' as default
             prune_mask=torch.zeros(actived_opacity.shape[1],device=actived_opacity.device).bool()
 
             frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')

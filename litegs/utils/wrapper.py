@@ -439,6 +439,7 @@ class GaussiansRasterFunc(torch.autograd.Function):
         color:torch.Tensor,
         opacities:torch.Tensor,
         tiles:torch.Tensor,
+        scores:torch.Tensor, # We are now logging the scores parameter with autograd because this forward is of class X(torch.autograd.Function)
         img_h:int,
         img_w:int,
         tile_h:int,
@@ -476,10 +477,13 @@ class GaussiansRasterFunc(torch.autograd.Function):
 
         grad_rgb_image_max=grad_rgb_image.abs().max()
         grad_rgb_image=grad_rgb_image/grad_rgb_image_max
-        grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,_,grad_o_square=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,packed_params,tiles,
+        grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,_,grad_o_square,grad_scores=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,packed_params,tiles,
                                                                                           transmitance,lst_contributor,
                                                                                           grad_rgb_image,grad_transmitance_image,grad_depth_image,grad_rgb_image_max,
                                                                                           img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
+        # to give None back if model param scores was None
+        grad_scores_out = grad_scores if ctx.needs_input_grad[7] else None
+
         if StatisticsHelperInst.bStart:
             #if err_sum.isinf().any() or err_square_sum.isinf().any():
             #    breakpoint()
@@ -493,19 +497,15 @@ class GaussiansRasterFunc(torch.autograd.Function):
         #     breakpoint()
 
         grads = (
-            None,
-            None,
-            grad_ndc,
-            grad_cov2d_inv,
-            grad_color,
-            grad_opacities,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None
+            None, None,                 # sorted_pointId, tile_start_index
+            grad_ndc,                   # ndc
+            grad_cov2d_inv,             # cov2d_inv
+            grad_color,                 # color
+            grad_opacities,             # opacities
+            None,                       # tiles
+            grad_scores_out,                # scores
+            None, None, None, None,     # img_h,img_w,tile_h,tile_w
+            None, None                  # enable_transmitance, enable_depth
         )
 
         return grads

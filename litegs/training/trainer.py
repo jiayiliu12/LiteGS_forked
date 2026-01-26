@@ -143,7 +143,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
                 #cluster culling
                 preprocess_start.record()
-                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_idx=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                 preprocess_end.record()
 
                 img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
@@ -229,7 +229,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
 
                         #cluster culling
-                        visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+                        visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_idx=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                         img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
