@@ -605,7 +605,7 @@ __global__ void raster_backward_kernel(
     constexpr float SCALER = 128.0f;
     constexpr float INV_SCALER = 1.0f / 128;
 
-    __shared__ half2 shared_img_grad[3][PIXELS_PER_THREAD][4 * 32];
+    __shared__ half2 shared_img_grad[4][PIXELS_PER_THREAD][4 * 32]; // it was shared_img_grad[3][PIXELS_PER_THREAD][4 * 32] before!
     __shared__ half2 shared_trans_grad_buffer[PIXELS_PER_THREAD][4 * 32];
     __shared__ unsigned int shared_last_contributor[PIXELS_PER_THREAD][4 * 32];//ushort2
 

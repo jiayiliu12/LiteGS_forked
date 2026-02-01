@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import json
 import wandb
 import torch.cuda.profiler as profiler
+# torch.autograd.set_detect_anomaly(True)
+
 
 from .. import arguments
 from .. import data

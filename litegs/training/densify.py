@@ -159,14 +159,18 @@ class DensityControllerOfficial(DensityControllerBase):
         # print("proj_matrix", proj_matrix.shape) -> proj_matrix torch.Size([1, 4, 4])
         # print("frustumplane", frustumplane.shape) -> frustumplane torch.Size([1, 6, 4])
 
+        # torch.cuda.synchronize()
         img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                     actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
+        # torch.cuda.synchronize()
+
         if not torch.isfinite(img).all():
             raise RuntimeError("img has NaN/Inf BEFORE backward")
-
+    
         try:
             img.sum().backward()
         except RuntimeError as e:
+            print("###########", e, "##########")
             raise
         else:
             if img_scores.grad is None:
@@ -174,14 +178,17 @@ class DensityControllerOfficial(DensityControllerBase):
             if not torch.isfinite(img_scores.grad).all():
                 raise RuntimeError("img_scores.grad has NaN/Inf")
             
-        scores.index_add_(0,culled_idx,img_scores.grad.reshape(-1)) # img_scores.grad: Shape [1,N_culled], scores: Shape [N]
-        return scores # Shape [N]
+        scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1).to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
+        del img, img_scores
+        del culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity, culled_idx
+        return
     
     def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,opacity,train_loader,actived_sh_degree,op,pp):
         # All model params are unclustered here
         with torch.enable_grad():
-            scores = torch.zeros_like(opacity.reshape(-1)) # one score for each Gaussian in the model! -> shape [N]
+            scores = torch.zeros(opacity.numel(), device="cpu", dtype=opacity.dtype) # one score for each Gaussian in the model! -> shape [N]
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
+                optimizer.zero_grad(set_to_none=True) # Reset all parameter gradients to save space in VRAM
                 # Get scores param
                 self.score_func_speedysplat(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
 
@@ -189,7 +196,8 @@ class DensityControllerOfficial(DensityControllerBase):
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
         value_nth_percentile = sorted_tensor[index_nth_percentile]
         # scores[scores==0] = 1 # TODO: Don't prune the Gaussians that were not scored???
-        prune_mask = ((scores <= value_nth_percentile))  # [N] bool
+        prune_mask = ((scores <= value_nth_percentile))  # [N] bool on CPU
+        del scores, sorted_tensor
         return prune_mask # Must have shape [N]
 
     # prune_speedysplat() is the same function as prune() below, just with a different prune_mask
@@ -221,6 +229,7 @@ class DensityControllerOfficial(DensityControllerBase):
             prune_mask=torch.zeros_like(prune_mask)
             prune_mask[del_indices]=True
         self._prune_optimizer(~prune_mask,optimizer)
+        del prune_mask
         return
     
     # for g in optimizer.param_groups:
@@ -350,8 +359,15 @@ class DensityControllerOfficial(DensityControllerBase):
             if epoch%self.densify_params.densification_interval==0:
                 self.split_and_clone(optimizer,epoch)
                 self.prune(optimizer)
-                # Speedy-Splat pruning: Prune 10% of all Gaussians
-                self.prune_speedysplat(optimizer,0.1,train_loader,actived_sh_degree,op,pp)
+
+                # Speedy-Splat soft pruning during densification
+                if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
+                    (epoch < self.densify_params.hard_prune_from_epoch) and \
+                    (epoch % self.densify_params.prune_epoch_interval == 0):
+                    print(f"Soft pruning at epoch {epoch} ####")
+                    # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
+                    self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp)
+
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
                 self.reset_opacity(optimizer,epoch)
@@ -360,6 +376,25 @@ class DensityControllerOfficial(DensityControllerBase):
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
+
+        # TODO: Implement hard pruning AFTER densification ends!!
+
+        # # Speedy-Splat hard pruning after densification
+        # if  (epoch >= self.densify_params.hard_prune_from_epoch) and \
+        #     (epoch % self.densify_params.prune_epoch_interval == 0):
+        #     bUpdate=False
+
+        #     print(f"Hard pruning at epoch {epoch} ####")
+        #     self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp)
+
+        #     bUpdate=True
+
+        #     if bUpdate:
+        #         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        #         StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+        #         torch.cuda.empty_cache()
+            
+
         return self._get_params_from_optimizer(optimizer)
     
 

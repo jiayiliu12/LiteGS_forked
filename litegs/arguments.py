@@ -98,7 +98,15 @@ class DensifyParams(ParamGroup):
     densify_until = -1
     opacity_reset_interval = 10
     opacity_reset_mode='decay'#'decay','reset'
+
     prune_mode='weight'#'weight','threshold'
+    soft_prune_from_epoch = 3 #1 #8
+    hard_prune_from_epoch = 10000 #1 #8
+    prune_epoch_interval = 5 #1 #5
+    soft_prune_ratio = 0.4
+    hard_prune_ratio = 0.4
+
+    # TODO: Is this the maximal number of Gaussians for densification? Or is this the goal for densification??
     target_primitives=1000000
     
 

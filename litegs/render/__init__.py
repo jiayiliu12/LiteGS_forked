@@ -23,7 +23,7 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
 
             # compute indices BEFORE uncluster (still chunk-level ids)
             ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
-            culled_idx = (visible_chunkid.long().unsqueeze(-1) * pp.cluster_size + ar).reshape(-1)
+            culled_idx = (visible_chunkid.long().unsqueeze(-1) * pp.cluster_size + ar).reshape(-1).detach().to("cpu", non_blocking=True)
 
             culled_xyz,culled_scale,culled_rot,color,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity)  
             if StatisticsHelperInst.bStart:

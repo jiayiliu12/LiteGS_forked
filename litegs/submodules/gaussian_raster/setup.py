@@ -31,8 +31,9 @@ if __name__ == '__main__':
                 "raster.cu",
                 "transform.cu"],
                 extra_compile_args={
-                        'cxx': ['-O3'],
-                        'nvcc': ['-O3', '--use_fast_math']
+                        'cxx': ['-O3'], # debug: '-O0', '-g'
+                        'nvcc': ['-O3', '--use_fast_math'] # debug: ("-O1", "-g",) "-lineinfo",  "-DTORCH_USE_CUDA_DSA"
+                        
                 },
             )
         ],
