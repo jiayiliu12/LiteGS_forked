@@ -10,8 +10,10 @@
 
 source /users/ljiayi/.local/share/mamba/etc/profile.d/mamba.sh
 micromamba activate litegs
-cd ~/LiteGS_forked/
+# cd ~/LiteGS_forked/
+rm -rf ~/wandb_sweep_copy/
+cp -R ~/LiteGS_forked/ ~/wandb_sweep_copy/LiteGS_forked
 module load gcc/10.2.0
 module load cuda/12.1.1
 
-python ./example_train_wandbsweep.py --sh_degree 3 -s ./../data/truck/ -i images/ -m output/firsttest
+python ~/wandb_sweep_copy/LiteGS_forked/example_train_wandbsweep.py --sh_degree 3 -s ~/data/truck/ -i images/ -m ~/wandb_sweep_copy/LiteGS_forked/output/firsttest
