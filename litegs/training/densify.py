@@ -163,20 +163,12 @@ class DensityControllerOfficial(DensityControllerBase):
         img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                     actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
         # torch.cuda.synchronize()
-
-        if not torch.isfinite(img).all():
-            raise RuntimeError("img has NaN/Inf BEFORE backward")
-    
+        
         try:
             img.sum().backward()
         except RuntimeError as e:
             print("###########", e, "##########")
             raise
-        else:
-            if img_scores.grad is None:
-                raise RuntimeError("no grad for img_scores")
-            if not torch.isfinite(img_scores.grad).all():
-                raise RuntimeError("img_scores.grad has NaN/Inf")
             
         scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1).to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
         del img, img_scores
@@ -363,7 +355,7 @@ class DensityControllerOfficial(DensityControllerBase):
                 # Speedy-Splat soft pruning during densification
                 if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
                     (epoch < self.densify_params.hard_prune_from_epoch) and \
-                    (epoch % self.densify_params.prune_epoch_interval == 0):
+                    (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
                     # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
                     self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp)
@@ -377,22 +369,16 @@ class DensityControllerOfficial(DensityControllerBase):
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
 
-        # TODO: Implement hard pruning AFTER densification ends!!
+        # Speedy-Splat hard pruning after densification
+        if  (epoch >= self.densify_params.hard_prune_from_epoch) and \
+            (epoch % self.densify_params.hard_prune_epoch_interval == 0):
 
-        # # Speedy-Splat hard pruning after densification
-        # if  (epoch >= self.densify_params.hard_prune_from_epoch) and \
-        #     (epoch % self.densify_params.prune_epoch_interval == 0):
-        #     bUpdate=False
+            print(f"Hard pruning at epoch {epoch} ####")
+            self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp)
 
-        #     print(f"Hard pruning at epoch {epoch} ####")
-        #     self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp)
-
-        #     bUpdate=True
-
-        #     if bUpdate:
-        #         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-        #         StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
-        #         torch.cuda.empty_cache()
+            xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+            StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+            torch.cuda.empty_cache()
             
 
         return self._get_params_from_optimizer(optimizer)
