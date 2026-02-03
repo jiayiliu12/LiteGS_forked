@@ -4,6 +4,9 @@ import sys
 
 import litegs
 import litegs.config
+
+import wandb
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     lp_cdo,op_cdo,pp_cdo,dp_cdo=litegs.config.get_default_arg()
@@ -23,5 +26,6 @@ if __name__ == "__main__":
     pp=litegs.arguments.PipelineParams.extract(args)
     dp=litegs.arguments.DensifyParams.extract(args)
 
+    wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
 
     litegs.training.start(lp,op,pp,dp,args.test_epochs,args.save_epochs,args.checkpoint_epochs,args.start_checkpoint)

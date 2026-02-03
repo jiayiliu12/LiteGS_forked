@@ -14,5 +14,4 @@ cd ~/LiteGS_forked/
 module load gcc/10.2.0
 module load cuda/12.1.1
 
-python ./example_train.py --sh_degree 3 -s ./../data/truck/ -i images/ -m output/firsttest
-# python ./example_train.py --sh_degree 3 -s ./../data/truck/ -i images/ -m output/firsttest --soft_prune_epoch_interval 10
+python ./example_train_wandbsweep.py --sh_degree 3 -s ./../data/truck/ -i images/ -m output/firsttest

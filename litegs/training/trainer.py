@@ -31,8 +31,6 @@ def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
     
-    wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
-
     densification_pruning_start = torch.cuda.Event(enable_timing=True)
     densification_pruning_end = torch.cuda.Event(enable_timing=True)
     backward_start = torch.cuda.Event(enable_timing=True)
