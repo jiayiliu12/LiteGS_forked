@@ -148,7 +148,11 @@ class DensityControllerOfficial(DensityControllerBase):
         # Get clustered params to calculate the score
         xyz,scale,rot,sh_0,sh_rest,opacity = self._get_params_from_optimizer(optimizer)
 
-        _,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_idx=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        
+        # Chunk-level ids -> per-point ids
+        ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
+        culled_idx = (visible_chunkid.to(torch.long).unsqueeze(-1) * pp.cluster_size + ar).reshape(-1).detach()
 
         img_scores = torch.zeros((1, culled_opacity.numel()), # Shape [B,N_culled] with B=1, according to what CUDA expects
                                 device=culled_opacity.device,
@@ -159,18 +163,11 @@ class DensityControllerOfficial(DensityControllerBase):
         # print("proj_matrix", proj_matrix.shape) -> proj_matrix torch.Size([1, 4, 4])
         # print("frustumplane", frustumplane.shape) -> frustumplane torch.Size([1, 6, 4])
 
-        # torch.cuda.synchronize()
         img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                     actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
-        # torch.cuda.synchronize()
-        
-        try:
-            img.sum().backward()
-        except RuntimeError as e:
-            print("###########", e, "##########")
-            raise
-            
-        scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1).to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
+
+        img.sum().backward()
+        scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1)) #.to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
         del img, img_scores
         del culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity, culled_idx
         return
@@ -178,7 +175,7 @@ class DensityControllerOfficial(DensityControllerBase):
     def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,opacity,train_loader,actived_sh_degree,op,pp):
         # All model params are unclustered here
         with torch.enable_grad():
-            scores = torch.zeros(opacity.numel(), device="cpu", dtype=opacity.dtype) # one score for each Gaussian in the model! -> shape [N]
+            scores = torch.zeros(opacity.numel(), device="cuda", dtype=opacity.dtype) #, pin_memory=True) # one score for each Gaussian in the model! -> shape [N]
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
                 optimizer.zero_grad(set_to_none=True) # Reset all parameter gradients to save space in VRAM
                 # Get scores param
@@ -188,11 +185,10 @@ class DensityControllerOfficial(DensityControllerBase):
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
         value_nth_percentile = sorted_tensor[index_nth_percentile]
         # scores[scores==0] = 1 # TODO: Don't prune the Gaussians that were not scored???
-        prune_mask = ((scores <= value_nth_percentile))  # [N] bool on CPU
+        prune_mask = ((scores <= value_nth_percentile))  # [N] bool on GPU
         del scores, sorted_tensor
         return prune_mask # Must have shape [N]
 
-    # prune_speedysplat() is the same function as prune() below, just with a different prune_mask
     @torch.no_grad()
     def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
 
@@ -400,7 +396,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
             frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
             weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
-            invisible = weight_sum==0#weight_sum<(weight_sum[weight_sum!=0].quantile(0.05))
+            invisible = weight_sum==0 # TODO: Change this back?? weight_sum<(weight_sum[weight_sum!=0].quantile(0.05)) 
             prune_mask[:invisible.shape[0]]|=invisible
         elif self.densify_params.prune_mode == 'threshold':
             prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)

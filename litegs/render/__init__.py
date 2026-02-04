@@ -21,14 +21,10 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
             visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity=utils.wrapper.CullCompactActivateWithSparseGrad.apply(
                 cluster_origin,cluster_extend,frustumplane,view_matrix,actived_sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity)
 
-            # compute indices BEFORE uncluster (still chunk-level ids)
-            ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
-            culled_idx = (visible_chunkid.long().unsqueeze(-1) * pp.cluster_size + ar).reshape(-1).detach().to("cpu", non_blocking=True)
-
             culled_xyz,culled_scale,culled_rot,color,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity)  
             if StatisticsHelperInst.bStart:
                 StatisticsHelperInst.set_compact_mask(visible_chunkid)
-            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_idx
+            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
         else:
             visibility,visible_num,visible_chunkid=utils.wrapper.litegs_fused.frustum_culling_aabb_cuda(cluster_origin,cluster_extend,frustumplane)
             visible_chunkid=visible_chunkid[:visible_num]
@@ -54,7 +50,7 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
     color=utils.wrapper.SphericalHarmonicToRGB.call_fused(actived_sh_degree,culled_sh_0,culled_sh_rest,dirs)
     nvtx.range_pop()
 
-    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_idx
+    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
 
 def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,color:torch.Tensor,opacity:torch.Tensor,
