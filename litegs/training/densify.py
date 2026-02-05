@@ -18,7 +18,7 @@ class DensityControllerBase:
         return
     
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp,scores):
         return self._get_params_from_optimizer(optimizer)
     
     @torch.no_grad()
@@ -188,6 +188,17 @@ class DensityControllerOfficial(DensityControllerBase):
         prune_mask = ((scores <= value_nth_percentile))  # [N] bool on GPU
         del scores, sorted_tensor
         return prune_mask # Must have shape [N]
+    
+    def get_prune_mask_speedysplat_new(self,percent,opacity,train_loader,actived_sh_degree,op,pp,scores):
+        # All model params are unclustered here
+        sorted_tensor, _ = torch.sort(scores)
+        index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
+        value_nth_percentile = sorted_tensor[index_nth_percentile]
+        # scores[scores==0] = 1 # TODO: Don't prune the Gaussians that were not scored???
+        prune_mask = ((scores <= value_nth_percentile))  # [N] bool on GPU
+        del scores, sorted_tensor
+        return prune_mask # Must have shape [N]
+
 
     @torch.no_grad()
     def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
@@ -206,6 +217,37 @@ class DensityControllerOfficial(DensityControllerBase):
 
         # prune_mask: shape [N]
         prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,opacity,train_loader,actived_sh_degree,op,pp) 
+
+        if prune_mask.sum() > 0.9 * opacity.shape[1]:
+            raise RuntimeError("Pruning would remove >90% of Gaussians")
+        if self.bCluster:
+            N=prune_mask.sum()
+            chunk_num=int(N/chunk_size)
+            del_limit=chunk_num*chunk_size
+            del_indices=prune_mask.nonzero()[:del_limit,0]
+            prune_mask=torch.zeros_like(prune_mask)
+            prune_mask[del_indices]=True
+        self._prune_optimizer(~prune_mask,optimizer)
+        del prune_mask
+        return
+    
+    @torch.no_grad()
+    def prune_speedysplat_new(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp,scores):
+
+        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        chunk_size = 1
+        if self.bCluster:
+            chunk_size=xyz.shape[-1]
+            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+            # xyz torch.Size([3, N])
+            # sh_0 torch.Size([1, 3, N])
+            # sh_rest torch.Size([15, 3, N])
+            # opacity torch.Size([1, N])
+            # scale torch.Size([3, N])
+            # rot torch.Size([4, N])
+
+        # prune_mask: shape [N]
+        prune_mask=self.get_prune_mask_speedysplat_new(prune_ratio,opacity,train_loader,actived_sh_degree,op,pp,scores) 
 
         if prune_mask.sum() > 0.9 * opacity.shape[1]:
             raise RuntimeError("Pruning would remove >90% of Gaussians")
@@ -341,7 +383,7 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp,scores):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
@@ -354,7 +396,7 @@ class DensityControllerOfficial(DensityControllerBase):
                     (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
                     # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
-                    self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp)
+                    self.prune_speedysplat_new(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp,scores)
 
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -370,7 +412,7 @@ class DensityControllerOfficial(DensityControllerBase):
             (epoch % self.densify_params.hard_prune_epoch_interval == 0):
 
             print(f"Hard pruning at epoch {epoch} ####")
-            self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp)
+            self.prune_speedysplat_new(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp,scores)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
             StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
