@@ -383,13 +383,10 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp,scores):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp,scores=None):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
-                self.split_and_clone(optimizer,epoch)
-                self.prune(optimizer)
-
                 # Speedy-Splat soft pruning during densification
                 if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
                     (epoch < self.densify_params.hard_prune_from_epoch) and \
@@ -397,6 +394,11 @@ class DensityControllerOfficial(DensityControllerBase):
                     print(f"Soft pruning at epoch {epoch} ####")
                     # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
                     self.prune_speedysplat_new(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp,scores)
+                
+                self.split_and_clone(optimizer,epoch)
+                self.prune(optimizer)
+
+
 
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
