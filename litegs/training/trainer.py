@@ -213,7 +213,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
                 wandb.log({
                     "train/total_loss": loss.item(),
-                    "train/L1": l1_loss.item(),x
+                    "train/L1": l1_loss.item(),
                     "gaussians/count": xyz.shape[1] * xyz.shape[2],
                     "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
                     "time/backward [ms]": backward_start.elapsed_time(backward_end),
