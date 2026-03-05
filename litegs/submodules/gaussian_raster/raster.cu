@@ -582,7 +582,7 @@ struct BackwardRegisterBuffer
     half2 alpha;
 };
 
-
+// warp has 32 threads. warp handles 128 pixels (1 tile). --> 4 pixels per thread. vector_size is 2 --> PIXELS_PER_THREAD = 128/(32*2) = 2 (actually 4, but SIMD makes it 2!)
 template <int tile_size_y, int tile_size_x,bool enable_statistic, bool enable_trans_grad, bool enable_depth_grad>
 __global__ void raster_backward_kernel(
     const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> sorted_points,    //[batch,tile]  p.s. tile_id 0 is invalid!
@@ -601,11 +601,11 @@ __global__ void raster_backward_kernel(
     int tiles_num_x, int img_h, int img_w)
 {
     constexpr int VECTOR_SIZE = 2;
-    constexpr int PIXELS_PER_THREAD = (tile_size_x * tile_size_y) / (32 * VECTOR_SIZE);//half2: 32 pixel per warp->64 pixel per warp
+    constexpr int PIXELS_PER_THREAD = (tile_size_x * tile_size_y) / (32 * VECTOR_SIZE);//half2: If 32 pixel per warp-> Then 64 pixel per warp
     constexpr float SCALER = 128.0f;
     constexpr float INV_SCALER = 1.0f / 128;
 
-    __shared__ half2 shared_img_grad[4][PIXELS_PER_THREAD][4 * 32]; // it was shared_img_grad[3][PIXELS_PER_THREAD][4 * 32] before!
+    __shared__ half2 shared_img_grad[3][PIXELS_PER_THREAD][4 * 32]; // RGB channels = 3
     __shared__ half2 shared_trans_grad_buffer[PIXELS_PER_THREAD][4 * 32];
     __shared__ unsigned int shared_last_contributor[PIXELS_PER_THREAD][4 * 32];//ushort2
 
@@ -635,7 +635,7 @@ __global__ void raster_backward_kernel(
             BackwardRegisterBuffer reg_buffer[PIXELS_PER_THREAD];
             //int lst[pixels_per_thread];
             #pragma unroll
-            for (int i = 0; i < PIXELS_PER_THREAD; i++)
+            for (int i = 0; i < PIXELS_PER_THREAD; i++) // PIXELS_PER_THREAD = 2, if tile_size_x * tile_size_y = 128.
             {
                 reg_buffer[i].r = half2(0.0f, 0.0f);
                 reg_buffer[i].g = half2(0.0f, 0.0f);
@@ -662,26 +662,26 @@ __global__ void raster_backward_kernel(
                 shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
                     d_img[batch_id][2][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
                     d_img[batch_id][2][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
-                if (enable_trans_grad)
-                {
-                    shared_img_grad[3][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
-                        d_trans_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
-                        d_trans_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
-                }
-                unsigned short last0 = last_contributor[batch_id][tile_id - 1][in_tile_y + 2 * i][in_tile_x];
+                // if (enable_trans_grad)
+                // {
+                //     shared_img_grad[3][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
+                //         d_trans_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
+                //         d_trans_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
+                // } // This was uncommented before!!
+                unsigned short last0 = last_contributor[batch_id][tile_id - 1][in_tile_y + 2 * i][in_tile_x]; //last_contributor = index of last Gaussian that affected it
                 last0 = last0 == 0 ? 0 : last0 - 1;
                 unsigned short last1 = last_contributor[batch_id][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x];
                 last1 = last1 == 0 ? 0 : last1 - 1;
                 index_in_tile = max(max(index_in_tile, last0), last1);
                 shared_last_contributor[i][threadIdx.y * blockDim.x + threadIdx.x] = (last1 << 16 | last0);
             }
-            index_in_tile = __reduce_max_sync(0xffffffff, index_in_tile);
+            index_in_tile = __reduce_max_sync(0xffffffff, index_in_tile); // Find the maximum index in the tile
 
             const int* points_in_tile = &sorted_points[batch_id][start_index_in_tile];
             const int pixel_x = ((tile_id - 1) % tiles_num_x) * tile_size_x + threadIdx.x % tile_size_x;
             const int pixel_y = ((tile_id - 1) / tiles_num_x) * tile_size_y + threadIdx.x / tile_size_x * PIXELS_PER_THREAD * VECTOR_SIZE;
 
-            for (; (index_in_tile >= 0); index_in_tile--)
+            for (; (index_in_tile >= 0); index_in_tile--) 
             {
                 float basic;
                 float bxcy;
@@ -703,7 +703,6 @@ __global__ void raster_backward_kernel(
                 point_color_x2.g = half2(params.rg.y, params.rg.y);
                 point_color_x2.b = half2(params.ba.x, params.ba.x);
                 point_color_x2.a = half2(params.ba.y, params.ba.y);
-                
 
                 half2 grad_r = half2(0, 0);
                 half2 grad_g = half2(0, 0);
@@ -713,6 +712,10 @@ __global__ void raster_backward_kernel(
                 float grad_bxcy = 0;
                 float grad_neg_half_c = 0;
                 float grad_basic = 0;
+                // NEW: pruning score accumulation
+                float local_dG2 = 0.0;
+                half2 grad_a_speedy = half2(0, 0);
+
                 #pragma unroll
                 for (int i = 0; i < PIXELS_PER_THREAD; i++)
                 {
@@ -742,22 +745,34 @@ __global__ void raster_backward_kernel(
                         d_alpha += (point_color_x2.r - reg_buffer[i].r) * reg_buffer[i].t * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
                         d_alpha += (point_color_x2.g - reg_buffer[i].g) * reg_buffer[i].t * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
                         d_alpha += (point_color_x2.b - reg_buffer[i].b) * reg_buffer[i].t * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        
+                        // NEW: pruning score accumulation
+                        half2 d_alpha_speedy = half2(0,0);
+                        d_alpha_speedy += (point_color_x2.r - reg_buffer[i].r) * reg_buffer[i].t; // Dummy d_img = 1 loss
+                        d_alpha_speedy += (point_color_x2.g - reg_buffer[i].g) * reg_buffer[i].t;
+                        d_alpha_speedy += (point_color_x2.b - reg_buffer[i].b) * reg_buffer[i].t;
+
                         reg_buffer[i].r += alpha * (point_color_x2.r - reg_buffer[i].r);//0-256
                         reg_buffer[i].g += alpha * (point_color_x2.g - reg_buffer[i].g);
                         reg_buffer[i].b += alpha * (point_color_x2.b - reg_buffer[i].b);
-                        if (enable_trans_grad)
-                        {
-                            d_alpha -= __h2div(shared_trans_grad_buffer[i][threadIdx.y * blockDim.x + threadIdx.x],
-                                (half2(1.0f, 1.0f) - alpha));
-                        }
+                        // if (enable_trans_grad)
+                        // {
+                        //     d_alpha -= __h2div(shared_trans_grad_buffer[i][threadIdx.y * blockDim.x + threadIdx.x],
+                        //         (half2(1.0f, 1.0f) - alpha));
+                        // }
 
                         grad_a += d_alpha * G;
                         half2 d_G = point_color_x2.a * d_alpha;
 
                         // NEW: pruning score accumulation
-                        float dg0 = (float)d_G.x * INV_SCALER;
-                        float dg1 = (float)d_G.y * INV_SCALER;
-                        atomicAdd(&out_dG2[batch_id][point_id], dg0 * dg0 + dg1 * dg1);
+                        grad_a_speedy += d_alpha * G;
+                        half2 d_G_speedy = point_color_x2.a * d_alpha_speedy;
+
+                        // NEW: pruning score accumulation
+                        // float dg0 = (float)d_G.x * INV_SCALER;
+                        // float dg1 = (float)d_G.y * INV_SCALER;
+                        // atomicAdd(&out_dG2[batch_id][point_id], dg0 * dg0 + dg1 * dg1);
+                        local_dG2 += __half2float(d_G.x) * __half2float(d_G.x) + __half2float(d_G.y) * __half2float(d_G.y);
 
                         half2 d_power = G * d_G;//G * point_alpha * d_alpha
                         if (enable_statistic)
@@ -775,6 +790,14 @@ __global__ void raster_backward_kernel(
                     }
                 }
                 
+                // New: pruning score accumulation
+                local_dG2 *= INV_SCALER * INV_SCALER;
+                warp_reduce_sum<float, false>(local_dG2);
+                if (threadIdx.x == 0)
+                {
+                    atomicAdd(&out_dG2[batch_id][point_id], local_dG2);
+                }
+
                 PackedGrad* grad_addr = (PackedGrad*)&packed_grad[batch_id][point_id][0];
                 //unsigned mask = __ballot_sync(0xffffffff, grad_opacity!=0);
                 if (__any_sync(0xffffffff, grad_a.x!=half(0)|| grad_a.y!=half(0)))

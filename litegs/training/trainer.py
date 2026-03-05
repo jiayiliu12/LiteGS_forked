@@ -10,8 +10,6 @@ import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 import json
 import wandb
-import torch.cuda.profiler as profiler
-# torch.autograd.set_detect_anomaly(True)
 
 
 from .. import arguments
@@ -113,7 +111,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar.update(0)
 
     #variables for wandb
-    iteration = 0
+    with torch.no_grad():
+        #variables for wandb
+        iteration = 0
+        sum_time=0
+        sum_time_with_prune=0
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -123,6 +125,24 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
             if actived_sh_degree<lp.sh_degree:
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
+
+            total_iteration_with_pruning_time=0
+            total_iteration_time=0
+            densification_pruning_time=0
+            scores=None
+
+        with torch.enable_grad():
+            prune_bool = ((epoch >= dp.soft_prune_from_epoch) and \
+                (epoch < dp.hard_prune_from_epoch) and \
+                (epoch % dp.soft_prune_epoch_interval == 0)) or \
+                ((epoch >= dp.hard_prune_from_epoch) and \
+                (epoch % dp.hard_prune_epoch_interval == 0))
+            # Speedy-Splat soft pruning during densification
+            if prune_bool:
+                print(f"Start Soft pruning at epoch {epoch} ####")
+                
+                scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype)
+                # print("scores has this shape: ", scores.shape)
 
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
@@ -143,11 +163,23 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
                 #cluster culling
                 preprocess_start.record()
+                # print("Opacity shape before culling: ", opacity.shape)
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                 preprocess_end.record()
 
-                img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                # print("Opacity shape after culling: ", culled_opacity.shape)
+
+                if not prune_bool:
+                    img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                             actived_sh_degree,gt_image.shape[2:],pp)
+                else:
+                    img_scores = torch.zeros((1, culled_opacity.numel()), # Shape [B,N_culled] with B=1, according to what CUDA expects
+                                        device=culled_opacity.device,
+                                        dtype=culled_opacity.dtype,
+                                        requires_grad=True).contiguous()
+                    # print("img_scores has this shape: ", img_scores.shape)
+                    img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                                                            actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
                                                             
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
@@ -176,15 +208,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 total_iteration_end.record()
                 total_iteration_end.synchronize()
 
+                total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                sum_time+=total_iteration_time
+
                 wandb.log({
                     "train/total_loss": loss.item(),
                     "train/L1": l1_loss.item(),
                     "gaussians/count": xyz.shape[1] * xyz.shape[2],
-                    
-                    # "time/train [ms]": train_time,
                     "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
                     "time/backward [ms]": backward_start.elapsed_time(backward_end),
-                    "time/total_iteration [ms]": total_iteration_start.elapsed_time(total_iteration_end),
+                    "time/total_iteration [ms]": total_iteration_time,
+                    "time/sum_time [ms]": sum_time,
                     "time/render [ms]": elapsed_times["render_time"],
                     "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
                     "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
@@ -193,6 +227,15 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     "time/render/Binning [ms]": elapsed_times["Binning_time"],
                     "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
                 }, iteration)
+                
+                # Speedy-Splat soft pruning during densification
+                if prune_bool:
+                    # Chunk-level ids -> per-point ids
+                    ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
+                    culled_idx = (visible_chunkid.to(torch.long).unsqueeze(-1) * pp.cluster_size + ar).reshape(-1).detach()
+                    scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1)) #.to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
+                    del img_scores, culled_idx
+                
                 iteration += 1
 
 
@@ -247,17 +290,22 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         densification_pruning_start.record()
-        # prune(train_loader,0.80,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,train_loader,actived_sh_degree,op,pp)
-        # prune(train_loader,0.30,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
+        
+        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,scores)
         densification_pruning_end.record()
 
         progress_bar.update()  
 
         densification_pruning_end.synchronize()
 
+        densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
+        total_iteration_with_pruning_time=total_iteration_time + densification_pruning_time
+        sum_time_with_prune+=sum_time + densification_pruning_time
+
         wandb.log({
-            f"time/densification_pruning" : densification_pruning_start.elapsed_time(densification_pruning_end),
+            "time/densification_pruning [ms]": densification_pruning_time,
+            "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
+            "time/sum_time_with_prune [ms]": sum_time_with_prune,
         }, iteration)
 
         if epoch in save_ply or epoch==total_epoch-1:

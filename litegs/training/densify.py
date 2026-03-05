@@ -18,7 +18,7 @@ class DensityControllerBase:
         return
     
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,scores):
         return self._get_params_from_optimizer(optimizer)
     
     @torch.no_grad()
@@ -172,15 +172,25 @@ class DensityControllerOfficial(DensityControllerBase):
         del culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity, culled_idx
         return
     
-    def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,opacity,train_loader,actived_sh_degree,op,pp):
-        # All model params are unclustered here
-        with torch.enable_grad():
-            scores = torch.zeros(opacity.numel(), device="cuda", dtype=opacity.dtype) #, pin_memory=True) # one score for each Gaussian in the model! -> shape [N]
-            for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
-                optimizer.zero_grad(set_to_none=True) # Reset all parameter gradients to save space in VRAM
-                # Get scores param
-                self.score_func_speedysplat(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
+    # def get_prune_mask_speedysplat(self,optimizer:torch.optim.Optimizer,percent,opacity,train_loader,actived_sh_degree,op,pp):
+    #     # All model params are unclustered here
+    #     with torch.enable_grad():
+    #         scores = torch.zeros(opacity.numel(), device="cuda", dtype=opacity.dtype) #, pin_memory=True) # one score for each Gaussian in the model! -> shape [N]
+    #         for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
+    #             optimizer.zero_grad(set_to_none=True) # Reset all parameter gradients to save space in VRAM
+    #             # Get scores param
+    #             self.score_func_speedysplat(view_matrix,proj_matrix,frustumplane,gt_image,scores,optimizer,actived_sh_degree,op,pp)
 
+    #     sorted_tensor, _ = torch.sort(scores)
+    #     index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
+    #     value_nth_percentile = sorted_tensor[index_nth_percentile]
+    #     # scores[scores==0] = 1 # TODO: Don't prune the Gaussians that were not scored???
+    #     prune_mask = ((scores <= value_nth_percentile))  # [N] bool on GPU
+    #     del scores, sorted_tensor
+    #     return prune_mask # Must have shape [N]
+
+    def get_prune_mask_speedysplat_new(self,percent,scores):
+        # All model params are unclustered here
         sorted_tensor, _ = torch.sort(scores)
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
         value_nth_percentile = sorted_tensor[index_nth_percentile]
@@ -189,11 +199,43 @@ class DensityControllerOfficial(DensityControllerBase):
         del scores, sorted_tensor
         return prune_mask # Must have shape [N]
 
+    # @torch.no_grad()
+    # def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
+
+    #     xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+    #     chunk_size = 1
+    #     if self.bCluster:
+    #         chunk_size=xyz.shape[-1]
+    #         xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+    #         # xyz torch.Size([3, N])
+    #         # sh_0 torch.Size([1, 3, N])
+    #         # sh_rest torch.Size([15, 3, N])
+    #         # opacity torch.Size([1, N])
+    #         # scale torch.Size([3, N])
+    #         # rot torch.Size([4, N])
+
+    #     # prune_mask: shape [N]
+    #     prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,opacity,train_loader,actived_sh_degree,op,pp) 
+
+    #     if prune_mask.sum() > 0.9 * opacity.shape[1]:
+    #         raise RuntimeError("Pruning would remove >90% of Gaussians")
+    #     if self.bCluster:
+    #         N=prune_mask.sum()
+    #         chunk_num=int(N/chunk_size)
+    #         del_limit=chunk_num*chunk_size
+    #         del_indices=prune_mask.nonzero()[:del_limit,0]
+    #         prune_mask=torch.zeros_like(prune_mask)
+    #         prune_mask[del_indices]=True
+    #     self._prune_optimizer(~prune_mask,optimizer)
+    #     del prune_mask
+    #     return
+    
+
     @torch.no_grad()
-    def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,train_loader,actived_sh_degree,op,pp):
+    def prune_speedysplat_new(self,optimizer:torch.optim.Optimizer,prune_ratio,scores):
 
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-        chunk_size = 1
+        chunk_size=1
         if self.bCluster:
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
@@ -203,9 +245,18 @@ class DensityControllerOfficial(DensityControllerBase):
             # opacity torch.Size([1, N])
             # scale torch.Size([3, N])
             # rot torch.Size([4, N])
+        
+        # Append ones to scores to match the new number of Gaussians after densification!
+        # padding_size=max(xyz.shape[-1]-scores.shape[0],scores.shape[0]-xyz.shape[-1])
+        # scores_padded=torch.nn.functional.pad(scores,(0,padding_size),value=1)
+        N = xyz.shape[-1]  # unclustered N
+        if scores.shape[0] < N:
+            scores_adj = torch.cat([scores, scores.new_full((N - scores.shape[0],), float("inf"))])
+        else:
+            raise RuntimeError("scores should not have more elements than the number of Gaussians in the model!")
 
         # prune_mask: shape [N]
-        prune_mask=self.get_prune_mask_speedysplat(optimizer,prune_ratio,opacity,train_loader,actived_sh_degree,op,pp) 
+        prune_mask=self.get_prune_mask_speedysplat_new(prune_ratio,scores_adj)
 
         if prune_mask.sum() > 0.9 * opacity.shape[1]:
             raise RuntimeError("Pruning would remove >90% of Gaussians")
@@ -341,12 +392,12 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,train_loader,actived_sh_degree,op,pp):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,scores):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
                 self.split_and_clone(optimizer,epoch)
-                self.prune(optimizer)
+                # self.prune(optimizer) // TODO: merge LiteGS prune with Speedy prune!!
 
                 # Speedy-Splat soft pruning during densification
                 if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
@@ -354,7 +405,7 @@ class DensityControllerOfficial(DensityControllerBase):
                     (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
                     # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
-                    self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,train_loader,actived_sh_degree,op,pp)
+                    self.prune_speedysplat_new(optimizer,self.densify_params.soft_prune_ratio,scores)
 
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -370,7 +421,7 @@ class DensityControllerOfficial(DensityControllerBase):
             (epoch % self.densify_params.hard_prune_epoch_interval == 0):
 
             print(f"Hard pruning at epoch {epoch} ####")
-            self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,train_loader,actived_sh_degree,op,pp)
+            self.prune_speedysplat_new(optimizer,self.densify_params.hard_prune_ratio,scores)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
             StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
