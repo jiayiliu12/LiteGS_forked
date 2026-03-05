@@ -193,7 +193,7 @@ class DensityControllerOfficial(DensityControllerBase):
         else:
             raise RuntimeError("scores should not have more elements than the number of Gaussians in the model!")
 
-        # prune_mask: shape [N]
+        # prune_mask: shape [N+new_points], bool, on GPU
         prune_mask_speedy=self.get_prune_mask_speedysplat(prune_ratio,scores_adj)
         prune_mask_litegs=self.get_prune_mask(opacity.sigmoid(),scale.exp())
         prune_mask=prune_mask_speedy|prune_mask_litegs
