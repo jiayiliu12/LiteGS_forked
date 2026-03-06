@@ -10,7 +10,7 @@ import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 import json
 import wandb
-import torch.cuda.profiler as profiler
+
 
 from .. import arguments
 from .. import data
@@ -57,9 +57,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 test_frames=[c for c in camera_frames if c.name in train_test_split["test"]]
         else:
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-            test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
-            # training_frames=[c for idx, c in enumerate(camera_frames) if idx >= len(camera_frames) / 10]
-            # test_frames=[c for idx, c in enumerate(camera_frames) if idx < len(camera_frames) / 10]
+            # test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
+            test_frames = [camera_frames[idx] for idx in range(0, 40, 8)] # ensures 5 testing imgs, which are idx % 8
     else:
         training_frames=camera_frames
         test_frames=None
@@ -114,7 +113,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar.update(0)
 
     #variables for wandb
-    iteration = 0
+    with torch.no_grad():
+        #variables for wandb
+        iteration = 0
+        sum_time=0
+        sum_time_with_prune=0
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -124,6 +127,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
             if actived_sh_degree<lp.sh_degree:
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
+
+            total_iteration_with_pruning_time=0
+            total_iteration_time=0
+            densification_pruning_time=0
 
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
@@ -141,10 +148,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     intr=denoised_training_intr
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
                 nvtx.range_pop()
-
-                # if iteration == 100: 
-                #     profiler.start()
-                #     print("!!! Profiling Started !!!")
 
                 #cluster culling
                 preprocess_start.record()
@@ -165,11 +168,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 loss.backward()
                 backward_end.record()
 
-                # if iteration >= 101:
-                #     profiler.stop()
-                #     print("!!! Profiling Finished !!!")
-                #     break
-
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
                 if pp.sparse_grad:
@@ -186,15 +184,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 total_iteration_end.record()
                 total_iteration_end.synchronize()
 
+                total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                sum_time+=total_iteration_time
+
                 wandb.log({
                     "train/total_loss": loss.item(),
                     "train/L1": l1_loss.item(),
                     "gaussians/count": xyz.shape[1] * xyz.shape[2],
-                    
-                    # "time/train [ms]": train_time,
                     "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
                     "time/backward [ms]": backward_start.elapsed_time(backward_end),
-                    "time/total_iteration [ms]": total_iteration_start.elapsed_time(total_iteration_end),
+                    "time/total_iteration [ms]": total_iteration_time,
+                    "time/sum_time [ms]": sum_time,
                     "time/render [ms]": elapsed_times["render_time"],
                     "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
                     "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
@@ -206,7 +206,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 iteration += 1
 
 
-        if epoch in test_epochs:
+        if epoch in test_epochs or epoch==total_epoch-1:
         # if lp.eval:
             with torch.no_grad():
                 _cluster_origin=None
@@ -259,13 +259,19 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         densification_pruning_start.record()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
         densification_pruning_end.record()
-        
+
         progress_bar.update()  
 
         densification_pruning_end.synchronize()
 
+        densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
+        total_iteration_with_pruning_time=total_iteration_time + densification_pruning_time
+        sum_time_with_prune+=sum_time + densification_pruning_time
+
         wandb.log({
-            f"time/densification_pruning" : densification_pruning_start.elapsed_time(densification_pruning_end),
+            "time/densification_pruning [ms]": densification_pruning_time,
+            "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
+            "time/sum_time_with_prune [ms]": sum_time_with_prune,
         }, iteration)
 
         if epoch in save_ply or epoch==total_epoch-1:
