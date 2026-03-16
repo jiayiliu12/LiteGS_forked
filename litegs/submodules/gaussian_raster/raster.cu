@@ -772,7 +772,7 @@ __global__ void raster_backward_kernel(
                         // float dg0 = (float)d_G.x * INV_SCALER;
                         // float dg1 = (float)d_G.y * INV_SCALER;
                         // atomicAdd(&out_dG2[batch_id][point_id], dg0 * dg0 + dg1 * dg1);
-                        local_dG2 += __half2float(d_G.x) * __half2float(d_G.x) + __half2float(d_G.y) * __half2float(d_G.y);
+                        local_dG2 += __half2float(d_G_speedy.x) * __half2float(d_G_speedy.x) + __half2float(d_G_speedy.y) * __half2float(d_G_speedy.y);
 
                         half2 d_power = G * d_G;//G * point_alpha * d_alpha
                         if (enable_statistic)
