@@ -110,6 +110,7 @@ class DensifyParams(ParamGroup):
     # TODO: Is this the maximal number of Gaussians for densification? Or is this the goal for densification??
     target_primitives=1000000
     
+    mass_threshold = 0.7
 
 
     #discard

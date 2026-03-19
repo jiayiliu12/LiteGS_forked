@@ -1,5 +1,6 @@
 import torch
 import math
+import wandb
 
 from ..arguments import DensifyParams
 from ..utils.statistic_helper import StatisticsHelperInst
@@ -18,7 +19,7 @@ class DensityControllerBase:
         return
     
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,scores):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,iteration,scores,num_training_views):
         return self._get_params_from_optimizer(optimizer)
     
     @torch.no_grad()
@@ -159,7 +160,7 @@ class DensityControllerOfficial(DensityControllerBase):
                                 dtype=culled_opacity.dtype,
                                 requires_grad=True).contiguous()
 
-        img,_,_,_,_,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+        img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                     actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
 
         img.sum().backward()
@@ -169,6 +170,7 @@ class DensityControllerOfficial(DensityControllerBase):
         return
 
     def get_prune_mask_speedysplat(self,percent,scores):
+        print("Percentage pruning")
         # All model params are unclustered here
         sorted_tensor, _ = torch.sort(scores)
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
@@ -177,26 +179,102 @@ class DensityControllerOfficial(DensityControllerBase):
         del scores, sorted_tensor
         return prune_mask # Must have shape [N]
 
-    @torch.no_grad()
-    def prune_speedysplat(self,optimizer:torch.optim.Optimizer,prune_ratio,scores):
+    def get_prune_mask_speedysplat_threshold(self,prune_scores_threshold,scores):
+        # All model params are unclustered here
+        # print(f"Pruning with score threshold {prune_scores_threshold} ####")
+        # print(f"min score {scores.min().item()} max score {scores.max().item()} mean score {scores.mean().item()} ####")
+        # print(f"score distribution: {torch.histc(scores.cpu(), bins=10, min=0, max=scores.max().item())} ####")
+        prune_mask = ((scores <= prune_scores_threshold))  # [N] bool on GPU
+        del scores
+        return prune_mask # Must have shape [N]
+    
+    def get_prune_mask_otsu_thresholding(self,scores,iteration,max_prune_ratio=0.85):
+        print("Otsu pruning")
+        N = scores.shape[0]
+        
+        hist = torch.histc(scores, bins=256)
+        bin_edges = torch.linspace(scores.min(), scores.max(), 257, device=scores.device)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        total = hist.sum()
+        cumsum = hist.cumsum(0)
+        cumsum_val = (hist * bin_centers).cumsum(0)
+        
+        w0 = cumsum / total
+        w1 = 1 - w0
+        mean0 = cumsum_val / cumsum.clamp(min=1)
+        mean1 = ((hist * bin_centers).sum() - cumsum_val) / (total - cumsum).clamp(min=1)
+        between_var = w0 * w1 * (mean0 - mean1) ** 2
+        
+        threshold = bin_centers[between_var.argmax()]
+        
+        # Safety cap
+        prune_ratio = (scores <= threshold).sum().item() / N
+        if prune_ratio > max_prune_ratio:
+            threshold = torch.quantile(scores.float(), max_prune_ratio)
+        
+        prune_mask = scores <= threshold
 
+        wandb.log({
+            "otsu_thresholding/threshold": threshold,
+            "otsu_thresholding/prune_ratio": prune_ratio,
+            "otsu_thresholding/score_distribution": wandb.Histogram(scores.cpu().numpy(), num_bins=256)
+        }, iteration)
+        return prune_mask
+
+
+    def get_prune_mask_score_mass(self, scores, iteration, max_prune_ratio=0.85):
+        print("score mass pruning")
+        sorted_scores, sorted_idx = torch.sort(scores, descending=True)
+        cumsum = sorted_scores.cumsum(0) / sorted_scores.sum()
+        keep_mass = self.densify_params.mass_threshold
+        keep_count = (cumsum < keep_mass).sum() + 1
+        
+        # Safety cap
+        min_keep = int((1 - max_prune_ratio) * scores.shape[0])
+        keep_count = max(keep_count, min_keep)
+        
+        prune_mask = torch.ones(scores.shape[0], device=scores.device, dtype=torch.bool)
+        prune_mask[sorted_idx[:keep_count]] = False
+        
+        wandb.log({
+            "score_mass/keep_count": keep_count,
+            "score_mass/total_count": scores.shape[0],
+            "score_mass/keep_ratio": keep_count / scores.shape[0],
+            "score_mass/threshold": sorted_scores[keep_count - 1].item(),
+        }, iteration)
+        
+        return prune_mask
+
+    @torch.no_grad()
+    def prune_speedysplat(self,optimizer:torch.optim.Optimizer,percent,scores,iteration):
         xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
         chunk_size=1
         if self.bCluster:
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
-        
+
+        # # NEW: Get mean squared contribution per pixel rather than total contribution. A small Gaussian that's critical at 50 pixels would score higher than a large redundant one at 10k pixels. 
+        # frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
+        # scores = scores / frag_count.clamp(min=1).sqrt()
+
+        # prune_mask: shape [N], bool, on GPU
+        # prune_mask_speedy=self.get_prune_mask_otsu_thresholding(scores, iteration, 0.85)
+        print(f"we are here !!!!!!!!! with {self.densify_params.mass_threshold}")
+        prune_mask_speedy=self.get_prune_mask_score_mass(scores, iteration, max_prune_ratio=0.85)
+        # prune_mask_speedy=self.get_prune_mask_speedysplat(0.0,scores) # dummy: try with nothing pruned!
+                
         # Append ones to scores to match the new number of Gaussians after densification!
         N = xyz.shape[-1]
         if scores.shape[0] < N:
-            scores_adj = torch.cat([scores, scores.new_full((N - scores.shape[0],), float("inf"))])
-        else:
+            prune_mask_speedy = torch.cat([prune_mask_speedy, prune_mask_speedy.new_full((N - scores.shape[0],), False)])
+        elif scores.shape[0] > N:
             raise RuntimeError("scores should not have more elements than the number of Gaussians in the model!")
 
-        # prune_mask: shape [N+new_points], bool, on GPU
-        prune_mask_speedy=self.get_prune_mask_speedysplat(prune_ratio,scores_adj)
         prune_mask_litegs=self.get_prune_mask(opacity.sigmoid(),scale.exp())
-        prune_mask=prune_mask_speedy|prune_mask_litegs
+        prune_mask=torch.logical_or(prune_mask_speedy,prune_mask_litegs)
+
+        # prune_mask_dummy = torch.cat([torch.full((scores.shape[0],), True, device=scores.device, dtype=torch.bool), torch.full((N - scores.shape[0],), False,  device=scores.device, dtype=torch.bool)])
 
         if prune_mask.sum() > 0.9 * opacity.shape[1]:
             raise RuntimeError("Pruning would remove >90% of Gaussians")
@@ -311,7 +389,7 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int,scores):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int,iteration:int,scores,num_training_views):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
@@ -322,8 +400,9 @@ class DensityControllerOfficial(DensityControllerBase):
                     (epoch < self.densify_params.hard_prune_from_epoch) and \
                     (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
-                    # print(f"self.densify_params.densify_until {self.densify_params.densify_until} ####")
-                    self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,scores)
+                    # if num_training_views is not None:
+                    #     self._log_score_stats(scores, epoch, optimizer, num_training_views, prune_type="soft")
+                    self.prune_speedysplat(optimizer,self.densify_params.soft_prune_ratio,scores,iteration)
 
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
@@ -339,7 +418,9 @@ class DensityControllerOfficial(DensityControllerBase):
             (epoch % self.densify_params.hard_prune_epoch_interval == 0):
 
             print(f"Hard pruning at epoch {epoch} ####")
-            self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,scores)
+            # if num_training_views is not None:
+            #     self._log_score_stats(scores, epoch, optimizer, num_training_views, prune_type="hard")
+            self.prune_speedysplat(optimizer,self.densify_params.hard_prune_ratio,scores,iteration)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
             StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)

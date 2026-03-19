@@ -38,4 +38,4 @@ export LD_LIBRARY_PATH="$(python -c 'import torch, os; print(os.path.join(os.pat
 python -c "import litegs_fused; print(litegs_fused.__file__)"
 
 cd ~/LiteGS_forked/
-python ./example_train.py --sh_degree 3 -s ./../data/truck/ -i images/ -m output/firsttest
+python ./example_train.py --sh_degree 3 -s /capstor/scratch/cscs/ljiayi/data/truck/ -i images/ -m output/firsttest

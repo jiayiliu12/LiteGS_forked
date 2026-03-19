@@ -139,7 +139,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 (epoch % dp.hard_prune_epoch_interval == 0))
             # Speedy-Splat soft pruning during densification
             if prune_bool:
-                print(f"Start Soft pruning at epoch {epoch} ####")
+                print(f"Start Soft pruning at epoch {epoch} ####") # FIX THIS! Its still starting after densification!
                 
                 scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype)
                 # print("scores has this shape: ", scores.shape)
@@ -286,7 +286,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         # --- Wandb image logging ---
                         # img and gt_image are [1, 3, H, W] tensors in [0, 1].
                         # We build a side-by-side panel: rendered (left) | GT (right).
-                        if batch_i in log_indices:
+                        if name == "Testset" and batch_i in log_indices:
                             rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()   # [H, W, 3]
                             gt_np       = gt_image[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                             panel       = np.concatenate([rendered_np, gt_np], axis=1)          # [H, 2W, 3]
