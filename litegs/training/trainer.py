@@ -221,7 +221,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_list=[]
                     psnr_list=[]
                     ssim_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,idx in loader:
+                    logged_images = []
+                    num_log_images = 6
+                    # Pick 6 evenly-spaced frame indices across the loader
+                    log_indices = set(np.linspace(0, len(loader) - 1, num_log_images, dtype=int).tolist())
+                    for batch_i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(loader):
                         view_matrix=view_matrix.cuda()
                         proj_matrix=proj_matrix.cuda()
                         frustumplane=frustumplane.cuda()
@@ -245,6 +249,22 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
+
+                        # --- Wandb image logging ---
+                        # img and gt_image are [1, 3, H, W] tensors in [0, 1].
+                        # We build a side-by-side panel: rendered (left) | GT (right).
+                        if name == "Testset" and batch_i in log_indices:
+                            rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()   # [H, W, 3]
+                            gt_np       = gt_image[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+                            panel       = np.concatenate([rendered_np, gt_np], axis=1)          # [H, 2W, 3]
+                            panel_uint8 = (panel * 255).astype(np.uint8)
+                            logged_images.append(
+                                wandb.Image(
+                                    panel_uint8,
+                                    caption=f"epoch {epoch} | {name} | frame {batch_i} | left: render  right: GT"
+                                )
+                            )
+
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
@@ -252,8 +272,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     wandb.log({
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
-                        f"test/ssim_{name}" : ssim_mean.item()
+                        f"test/ssim_{name}" : ssim_mean.item(),
                     }, iteration)
+                    if name=="Testset":
+                        wandb.log({
+                            f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
+                        }, iteration)
+                        
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         densification_pruning_start.record()
