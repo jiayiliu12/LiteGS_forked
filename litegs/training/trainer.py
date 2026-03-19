@@ -306,8 +306,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                        f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
                     }, iteration)
+                    if name=="Testset":
+                        wandb.log({
+                            f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
+                        }, iteration)
+                        
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         densification_pruning_start.record()
