@@ -112,7 +112,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     #variables for wandb
     with torch.no_grad():
-        #variables for wandb
         iteration = 0
         sum_time=0
         sum_time_with_prune=0
@@ -129,20 +128,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             total_iteration_with_pruning_time=0
             total_iteration_time=0
             densification_pruning_time=0
-            scores=None
 
-        with torch.enable_grad():
-            prune_bool = ((epoch >= dp.soft_prune_from_epoch) and \
-                (epoch < dp.hard_prune_from_epoch) and \
-                (epoch % dp.soft_prune_epoch_interval == 0)) or \
-                ((epoch >= dp.hard_prune_from_epoch) and \
-                (epoch % dp.hard_prune_epoch_interval == 0))
-            # Speedy-Splat soft pruning during densification
+            prune_bool = (
+                (epoch >= dp.soft_prune_from_epoch and epoch < dp.hard_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
+                (epoch >= dp.hard_prune_from_epoch and epoch % dp.hard_prune_epoch_interval == 0)
+            )
+            scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype) if prune_bool else None
             if prune_bool:
-                print(f"Start Soft pruning at epoch {epoch} ####") # FIX THIS! Its still starting after densification!
-                
-                scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype)
-                # print("scores has this shape: ", scores.shape)
+                print(f"Start soft/hard pruning at epoch {epoch} ####")
 
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
@@ -167,19 +160,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                 preprocess_end.record()
 
-                # print("Opacity shape after culling: ", culled_opacity.shape)
-
-                if not prune_bool:
-                    img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp)
-                else:
-                    img_scores = torch.zeros((1, culled_opacity.numel()), # Shape [B,N_culled] with B=1, according to what CUDA expects
-                                        device=culled_opacity.device,
-                                        dtype=culled_opacity.dtype,
-                                        requires_grad=True).contiguous()
-                    # print("img_scores has this shape: ", img_scores.shape)
-                    img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
+                img_scores = (
+                    torch.zeros((1, culled_opacity.numel()), device=culled_opacity.device,
+                                dtype=culled_opacity.dtype, requires_grad=True).contiguous()
+                    if prune_bool else None
+                )
+                img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                                                        actived_sh_degree,gt_image.shape[2:],pp,scores=img_scores)
                                                             
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
@@ -228,13 +215,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
                 }, iteration)
                 
-                # Speedy-Splat soft pruning during densification
                 if prune_bool:
-                    # Chunk-level ids -> per-point ids
-                    ar = torch.arange(pp.cluster_size, device=visible_chunkid.device, dtype=torch.long)
-                    culled_idx = (visible_chunkid.to(torch.long).unsqueeze(-1) * pp.cluster_size + ar).reshape(-1).detach()
-                    scores.index_add_(0,culled_idx,img_scores.grad.detach().reshape(-1)) #.to("cpu", non_blocking=True)) # img_scores.grad: shape [1,N_culled]; scores: shape [N]
-                    del img_scores, culled_idx
+                    density_controller.accumulate_scores(scores, visible_chunkid, img_scores, pp.cluster_size)
+                    del img_scores
                 
                 iteration+=1
 

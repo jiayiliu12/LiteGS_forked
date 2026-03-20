@@ -54,7 +54,7 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
 
 def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,color:torch.Tensor,opacity:torch.Tensor,
-           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams,scores=None)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams,scores=None)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,dict]:
 
     #profile each function
     render_start = torch.cuda.Event(enable_timing=True)
