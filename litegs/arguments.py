@@ -1,6 +1,4 @@
-from argparse import ArgumentParser, Namespace
-import sys
-import os
+from argparse import ArgumentParser
 
 class GroupParams:
     pass
@@ -107,11 +105,12 @@ class DensifyParams(ParamGroup):
     soft_prune_ratio = 0.4
     hard_prune_ratio = 0.2 # 0.3
 
-    # TODO: Is this the maximal number of Gaussians for densification? Or is this the goal for densification??
+    # Goal for densification
     target_primitives=1000000
     
-    mass_threshold = 0.7
+    mass_threshold = 0.94
 
+    verbosity = False # False to disable irrelevant WandB logs in trainer.py and densify.py. Leaves the final Testing PSNR, Gaussian count, 
 
     #discard
     densify_grad_threshold = 0.00015

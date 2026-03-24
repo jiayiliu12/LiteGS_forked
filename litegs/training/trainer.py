@@ -23,20 +23,24 @@ from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
 
+
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
 
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
     
-    densification_pruning_start = torch.cuda.Event(enable_timing=True)
-    densification_pruning_end = torch.cuda.Event(enable_timing=True)
-    backward_start = torch.cuda.Event(enable_timing=True)
-    backward_end = torch.cuda.Event(enable_timing=True)
-    preprocess_start = torch.cuda.Event(enable_timing=True)
-    preprocess_end = torch.cuda.Event(enable_timing=True)
-    total_iteration_start = torch.cuda.Event(enable_timing=True)
-    total_iteration_end = torch.cuda.Event(enable_timing=True)
+    VERBOSE = dp.verbosity
+    
+    if VERBOSE:
+        densification_pruning_start = torch.cuda.Event(enable_timing=True)
+        densification_pruning_end = torch.cuda.Event(enable_timing=True)
+        backward_start = torch.cuda.Event(enable_timing=True)
+        backward_end = torch.cuda.Event(enable_timing=True)
+        preprocess_start = torch.cuda.Event(enable_timing=True)
+        preprocess_end = torch.cuda.Event(enable_timing=True)
+        total_iteration_start = torch.cuda.Event(enable_timing=True)
+        total_iteration_end = torch.cuda.Event(enable_timing=True)
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
@@ -137,9 +141,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             if prune_bool:
                 print(f"Start soft/hard pruning at epoch {epoch} ####")
 
+        torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
-                total_iteration_start.record()
+                if VERBOSE:
+                    total_iteration_start.record()
 
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
@@ -155,10 +161,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 nvtx.range_pop()
 
                 #cluster culling
-                preprocess_start.record()
-                # print("Opacity shape before culling: ", opacity.shape)
+                if VERBOSE:
+                    preprocess_start.record()
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                preprocess_end.record()
+                if VERBOSE:
+                    preprocess_end.record()
 
                 img_scores = (
                     torch.zeros((1, culled_opacity.numel()), device=culled_opacity.device,
@@ -175,9 +182,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
 
-                backward_start.record()
+                if VERBOSE:
+                    backward_start.record()
                 loss.backward()
-                backward_end.record()
+                if VERBOSE:
+                    backward_end.record()
 
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -192,28 +201,30 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.step()
                     # proj_opt.zero_grad()
                 schedular.step()
-                total_iteration_end.record()
-                total_iteration_end.synchronize()
 
-                total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
-                sum_time+=total_iteration_time
+                if VERBOSE:
+                    total_iteration_end.record()
+                    total_iteration_end.synchronize()
 
-                wandb.log({
-                    "train/total_loss": loss.item(),
-                    "train/L1": l1_loss.item(),
-                    "gaussians/count": xyz.shape[1] * xyz.shape[2],
-                    "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
-                    "time/backward [ms]": backward_start.elapsed_time(backward_end),
-                    "time/total_iteration [ms]": total_iteration_time,
-                    "time/sum_time [ms]": sum_time,
-                    "time/render [ms]": elapsed_times["render_time"],
-                    "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
-                    "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
-                    "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
-                    "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
-                    "time/render/Binning [ms]": elapsed_times["Binning_time"],
-                    "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
-                }, iteration)
+                    total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                    sum_time+=total_iteration_time
+
+                    wandb.log({
+                        "train/total_loss": loss.item(),
+                        "train/L1": l1_loss.item(),
+                        "gaussians/count": xyz.shape[1] * xyz.shape[2],
+                        "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
+                        "time/backward [ms]": backward_start.elapsed_time(backward_end),
+                        "time/total_iteration [ms]": total_iteration_time,
+                        "time/sum_time [ms]": sum_time,
+                        "time/render [ms]": elapsed_times["render_time"],
+                        "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
+                        "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
+                        "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
+                        "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
+                        "time/render/Binning [ms]": elapsed_times["Binning_time"],
+                        "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
+                    }, iteration)
                 
                 if prune_bool:
                     density_controller.accumulate_scores(scores, visible_chunkid, img_scores, pp.cluster_size)
@@ -222,8 +233,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 iteration+=1
 
 
-        if epoch in test_epochs or epoch==total_epoch-1:
-        # if lp.eval:
+        if VERBOSE and (epoch in test_epochs or epoch==total_epoch-1):
             with torch.no_grad():
                 _cluster_origin=None
                 _cluster_extend=None
@@ -297,29 +307,31 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
-        densification_pruning_start.record()
-        
+        if VERBOSE:
+            densification_pruning_start.record()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
-        densification_pruning_end.record()
+        if VERBOSE:
+            densification_pruning_end.record()
 
         progress_bar.update()  
 
-        densification_pruning_end.synchronize()
+        if VERBOSE:
+            densification_pruning_end.synchronize()
 
-        densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
-        total_iteration_with_pruning_time=total_iteration_time+densification_pruning_time
-        sum_time_with_prune+=total_iteration_with_pruning_time
+            densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
+            total_iteration_with_pruning_time=total_iteration_time+densification_pruning_time
+            sum_time_with_prune+=total_iteration_with_pruning_time
 
-        wandb.log({
-            "time/densification_pruning [ms]": densification_pruning_time,
-            "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
-            "time/sum_time_with_prune [ms]": sum_time_with_prune,
-        }, iteration)
+            wandb.log({
+                "time/densification_pruning [ms]": densification_pruning_time,
+                "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
+                "time/sum_time_with_prune [ms]": sum_time_with_prune,
+            }, iteration)
 
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:
                 progress_bar.close()
-                print("{} takes: {}".format(lp.model_path,progress_bar.format_dict['elapsed']))
+                print("{} takes: {} seconds.".format(lp.model_path,progress_bar.format_dict['elapsed']))
                 save_path=os.path.join(lp.model_path,"point_cloud","finish")
             else:
                 save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))    

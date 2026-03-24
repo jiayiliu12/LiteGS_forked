@@ -154,12 +154,13 @@ class DensityControllerOfficial(DensityControllerBase):
         prune_mask = torch.ones(scores.shape[0], device=scores.device, dtype=torch.bool)
         prune_mask[sorted_idx[:keep_count]] = False
 
-        wandb.log({
-            "score_mass/keep_count": keep_count,
-            "score_mass/total_count": scores.shape[0],
-            "score_mass/keep_ratio": keep_count / scores.shape[0],
-            "score_mass/threshold": sorted_scores[keep_count - 1].item(),
-        }, iteration)
+        if self.densify_params.verbosity:
+            wandb.log({
+                "score_mass/keep_count": keep_count,
+                "score_mass/total_count": scores.shape[0],
+                "score_mass/keep_ratio": keep_count / scores.shape[0],
+                "score_mass/threshold": sorted_scores[keep_count - 1].item(),
+            }, iteration)
 
         return prune_mask
 
