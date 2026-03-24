@@ -714,7 +714,8 @@ __global__ void raster_backward_kernel(
                 float grad_basic = 0;
                 // NEW: pruning score accumulation
                 float local_dG2 = 0.0;
-                half2 grad_a_speedy = half2(0, 0);
+                float alpha_sq = __half2float(point_color_x2.a.x);
+                alpha_sq *= alpha_sq;
 
                 #pragma unroll
                 for (int i = 0; i < PIXELS_PER_THREAD; i++)
@@ -765,14 +766,9 @@ __global__ void raster_backward_kernel(
                         half2 d_G = point_color_x2.a * d_alpha;
 
                         // NEW: pruning score accumulation
-                        grad_a_speedy += d_alpha * G;
-                        half2 d_G_speedy = point_color_x2.a * d_alpha_speedy;
-
-                        // NEW: pruning score accumulation
-                        // float dg0 = (float)d_G.x * INV_SCALER;
-                        // float dg1 = (float)d_G.y * INV_SCALER;
-                        // atomicAdd(&out_dG2[batch_id][point_id], dg0 * dg0 + dg1 * dg1);
-                        local_dG2 += __half2float(d_G_speedy.x) * __half2float(d_G_speedy.x) + __half2float(d_G_speedy.y) * __half2float(d_G_speedy.y);
+                        float dgs_x = __half2float(d_alpha_speedy.x);
+                        float dgs_y = __half2float(d_alpha_speedy.y);
+                        local_dG2 += alpha_sq * (dgs_x * dgs_x + dgs_y * dgs_y);
 
                         half2 d_power = G * d_G;//G * point_alpha * d_alpha
                         if (enable_statistic)
