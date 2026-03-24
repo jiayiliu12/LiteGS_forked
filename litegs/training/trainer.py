@@ -32,15 +32,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     
     VERBOSE = dp.verbosity
     
-    if VERBOSE:
-        densification_pruning_start = torch.cuda.Event(enable_timing=True)
-        densification_pruning_end = torch.cuda.Event(enable_timing=True)
-        backward_start = torch.cuda.Event(enable_timing=True)
-        backward_end = torch.cuda.Event(enable_timing=True)
-        preprocess_start = torch.cuda.Event(enable_timing=True)
-        preprocess_end = torch.cuda.Event(enable_timing=True)
-        total_iteration_start = torch.cuda.Event(enable_timing=True)
-        total_iteration_end = torch.cuda.Event(enable_timing=True)
+    densification_pruning_start = torch.cuda.Event(enable_timing=True)
+    densification_pruning_end = torch.cuda.Event(enable_timing=True)
+    backward_start = torch.cuda.Event(enable_timing=True)
+    backward_end = torch.cuda.Event(enable_timing=True)
+    preprocess_start = torch.cuda.Event(enable_timing=True)
+    preprocess_end = torch.cuda.Event(enable_timing=True)
+    total_iteration_start = torch.cuda.Event(enable_timing=True)
+    total_iteration_end = torch.cuda.Event(enable_timing=True)
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
@@ -144,8 +143,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
-                if VERBOSE:
-                    total_iteration_start.record()
+                
+                total_iteration_start.record()
 
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
@@ -182,11 +181,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
 
-                if VERBOSE:
-                    backward_start.record()
+                backward_start.record()
                 loss.backward()
-                if VERBOSE:
-                    backward_end.record()
+                backward_end.record()
 
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -202,28 +199,31 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     # proj_opt.zero_grad()
                 schedular.step()
 
-                if VERBOSE:
-                    total_iteration_end.record()
-                    total_iteration_end.synchronize()
+                
+                total_iteration_end.record()
+                total_iteration_end.synchronize()
+                total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                wandb.log({
+                        "train/total_loss": loss.item(),
+                        "gaussians/count": xyz.shape[1] * xyz.shape[2],
+                        "time/backward [ms]": backward_start.elapsed_time(backward_end),
+                        "time/render [ms]": elapsed_times["render_time"],
+                        "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
+                    }, iteration)
 
-                    total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                if VERBOSE:
                     sum_time+=total_iteration_time
 
                     wandb.log({
-                        "train/total_loss": loss.item(),
                         "train/L1": l1_loss.item(),
-                        "gaussians/count": xyz.shape[1] * xyz.shape[2],
                         "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
-                        "time/backward [ms]": backward_start.elapsed_time(backward_end),
                         "time/total_iteration [ms]": total_iteration_time,
                         "time/sum_time [ms]": sum_time,
-                        "time/render [ms]": elapsed_times["render_time"],
                         "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
                         "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
                         "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
                         "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
                         "time/render/Binning [ms]": elapsed_times["Binning_time"],
-                        "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
                     }, iteration)
                 
                 if prune_bool:
@@ -233,7 +233,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 iteration+=1
 
 
-        if VERBOSE and (epoch in test_epochs or epoch==total_epoch-1):
+        if epoch in test_epochs or epoch==total_epoch-1:
             with torch.no_grad():
                 _cluster_origin=None
                 _cluster_extend=None
@@ -279,17 +279,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         # --- Wandb image logging ---
                         # img and gt_image are [1, 3, H, W] tensors in [0, 1].
                         # We build a side-by-side panel: rendered (left) | GT (right).
-                        if name == "Testset" and batch_i in log_indices:
-                            rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()   # [H, W, 3]
-                            gt_np       = gt_image[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
-                            panel       = np.concatenate([rendered_np, gt_np], axis=1)          # [H, 2W, 3]
-                            panel_uint8 = (panel * 255).astype(np.uint8)
-                            logged_images.append(
-                                wandb.Image(
-                                    panel_uint8,
-                                    caption=f"epoch {epoch} | {name} | frame {batch_i} | left: render  right: GT"
+                        if VERBOSE: 
+                            if name == "Testset" and batch_i in log_indices:
+                                rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()   # [H, W, 3]
+                                gt_np       = gt_image[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+                                panel       = np.concatenate([rendered_np, gt_np], axis=1)          # [H, 2W, 3]
+                                panel_uint8 = (panel * 255).astype(np.uint8)
+                                logged_images.append(
+                                    wandb.Image(
+                                        panel_uint8,
+                                        caption=f"epoch {epoch} | {name} | frame {batch_i} | left: render  right: GT"
+                                    )
                                 )
-                            )
 
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
@@ -300,33 +301,29 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
                     }, iteration)
-                    if name=="Testset":
-                        wandb.log({
-                            f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
-                        }, iteration)
-                        
+                    if VERBOSE:
+                        if name=="Testset":
+                            wandb.log({
+                                f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
+                            }, iteration)
+                            
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
-        if VERBOSE:
-            densification_pruning_start.record()
+        densification_pruning_start.record()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
-        if VERBOSE:
-            densification_pruning_end.record()
+        densification_pruning_end.record()
+        densification_pruning_end.synchronize()
+        densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
+        total_iteration_with_pruning_time=total_iteration_time+densification_pruning_time
+        sum_time_with_prune+=total_iteration_with_pruning_time
 
-        progress_bar.update()  
-
-        if VERBOSE:
-            densification_pruning_end.synchronize()
-
-            densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
-            total_iteration_with_pruning_time=total_iteration_time+densification_pruning_time
-            sum_time_with_prune+=total_iteration_with_pruning_time
-
-            wandb.log({
+        wandb.log({
                 "time/densification_pruning [ms]": densification_pruning_time,
                 "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
                 "time/sum_time_with_prune [ms]": sum_time_with_prune,
             }, iteration)
+
+        progress_bar.update()
 
         if epoch in save_ply or epoch==total_epoch-1:
             if epoch==total_epoch-1:

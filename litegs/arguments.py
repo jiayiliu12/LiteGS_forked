@@ -110,7 +110,7 @@ class DensifyParams(ParamGroup):
     
     mass_threshold = 0.94
 
-    verbosity = False # False to disable irrelevant WandB logs in trainer.py and densify.py. Leaves the final Testing PSNR, Gaussian count, 
+    verbosity = False # False to disable irrelevant WandB logs in trainer.py and densify.py. Only shows: final Testing PSNR, Testing SSIM, Gaussian count, render time, rasterize time, backward time, and total time.
 
     #discard
     densify_grad_threshold = 0.00015
