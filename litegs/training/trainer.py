@@ -7,6 +7,7 @@ import numpy as np
 import math
 import os
 import torch.cuda.nvtx as nvtx
+import time
 import matplotlib.pyplot as plt
 import json
 import wandb
@@ -38,8 +39,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     backward_end = torch.cuda.Event(enable_timing=True)
     preprocess_start = torch.cuda.Event(enable_timing=True)
     preprocess_end = torch.cuda.Event(enable_timing=True)
-    total_iteration_start = torch.cuda.Event(enable_timing=True)
-    total_iteration_end = torch.cuda.Event(enable_timing=True)
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
@@ -119,6 +118,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         sum_time=0
         sum_time_with_prune=0
 
+    # benchmark accumulators
+    _WARMUP_ITERS = min(100, max(10, op.iterations // 300))
+    _all_iter_ms: list[float] = []    # wall-clock time per training iteration
+    _all_densify_ms: list[float] = [] # wall-clock time per densification step
+
     for epoch in range(start_epoch,total_epoch):
 
         with torch.no_grad():
@@ -140,11 +144,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             if prune_bool:
                 print(f"Start soft/hard pruning at epoch {epoch} ####")
 
+        _epoch_score_accum_ms = 0.0
         torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
                 
-                total_iteration_start.record()
+                _iter_t0 = time.perf_counter()
 
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
@@ -200,9 +205,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 schedular.step()
 
                 
-                total_iteration_end.record()
-                total_iteration_end.synchronize()
-                total_iteration_time = total_iteration_start.elapsed_time(total_iteration_end)
+                torch.cuda.synchronize()
+                _iter_ms = (time.perf_counter() - _iter_t0) * 1000
+                _all_iter_ms.append(_iter_ms)
+                total_iteration_time = _iter_ms
                 wandb.log({
                         "train/total_loss": loss.item(),
                         "gaussians/count": xyz.shape[1] * xyz.shape[2],
@@ -227,7 +233,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     }, iteration)
                 
                 if prune_bool:
+                    torch.cuda.synchronize()
+                    _accum_t0 = time.perf_counter()
                     density_controller.accumulate_scores(scores, visible_chunkid, img_scores, pp.cluster_size)
+                    torch.cuda.synchronize()
+                    _epoch_score_accum_ms += (time.perf_counter() - _accum_t0) * 1000
                     del img_scores
                 
                 iteration+=1
@@ -309,11 +319,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
-        densification_pruning_start.record()
+        _densify_t0 = time.perf_counter()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
-        densification_pruning_end.record()
-        densification_pruning_end.synchronize()
-        densification_pruning_time=densification_pruning_start.elapsed_time(densification_pruning_end)
+        torch.cuda.synchronize()
+        densification_pruning_time = (time.perf_counter() - _densify_t0) * 1000 + _epoch_score_accum_ms
+        _all_densify_ms.append(densification_pruning_time)
         total_iteration_with_pruning_time=total_iteration_time+densification_pruning_time
         sum_time_with_prune+=total_iteration_with_pruning_time
 
@@ -346,5 +356,40 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         if epoch in save_checkpoint:
             io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
-    
+
+    # --- Benchmark Summary ---
+    _bench_iters = np.array(_all_iter_ms[_WARMUP_ITERS:]) if len(_all_iter_ms) > _WARMUP_ITERS else np.array(_all_iter_ms)
+    _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
+    _total_iter_s    = np.array(_all_iter_ms).sum() / 1000   # includes warmup
+    _total_densify_s = _densify_arr.sum() / 1000
+
+    _gpu_name = torch.cuda.get_device_name(0)
+    _bench_scalars = {
+        "benchmark/iter_mean_ms":         float(np.mean(_bench_iters)),
+        "benchmark/iter_median_ms":       float(np.median(_bench_iters)),
+        "benchmark/iter_std_ms":          float(np.std(_bench_iters)),
+        "benchmark/densify_mean_ms":      float(np.mean(_densify_arr)),
+        "benchmark/densify_total_s":      round(_total_densify_s, 3),
+        "benchmark/total_training_s":     round(_total_iter_s, 3),
+        "benchmark/total_with_densify_s": round(_total_iter_s + _total_densify_s, 3),
+    }
+    wandb.log({
+        **_bench_scalars,
+        "benchmark/iter_time_histogram":     wandb.Histogram(np.array(_bench_iters)),
+        "benchmark/densify_time_histogram":  wandb.Histogram(_densify_arr),
+    })
+    wandb.summary.update({
+        "benchmark/gpu":          _gpu_name,
+        "benchmark/warmup_iters": _WARMUP_ITERS,
+        "benchmark/measured_iters": len(_bench_iters),
+        **_bench_scalars,
+    })
+    print("\n=== Training Benchmark ===")
+    print(f"  GPU:            {_gpu_name}")
+    print(f"  Iters measured: {len(_bench_iters):,}  (excl. {_WARMUP_ITERS} warmup)")
+    print(f"  Iter time:      mean {np.mean(_bench_iters):.2f} ms  |  median {np.median(_bench_iters):.2f} ms  |  std {np.std(_bench_iters):.2f} ms")
+    print(f"  Densification:  mean {np.mean(_densify_arr):.2f} ms  |  total {_total_densify_s:.2f} s  ({len(_all_densify_ms)} steps)")
+    print(f"  Pure training:  {_total_iter_s:.1f} s")
+    print(f"  Incl. densify:  {_total_iter_s + _total_densify_s:.1f} s")
+    print("==========================\n")
     return
