@@ -108,7 +108,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     if dp.densify_until<0:
         dp.densify_until=int(total_epoch*0.8/dp.opacity_reset_interval)*dp.opacity_reset_interval+1
     density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
-    StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
+    StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_stats_needed)
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
@@ -136,10 +136,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             total_iteration_time=0
             densification_pruning_time=0
 
+            # prune_bool = (
+            #     (epoch >= dp.densify_from and epoch < dp.densify_until) and
+            #     (epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == dp.soft_prune_epoch_interval - 1) or
+            #     (dp.hard_prune and epoch == dp.densify_until) # Only hard prune once after densification!
+            # )
             prune_bool = (
-                (epoch >= dp.soft_prune_from_epoch and epoch < dp.hard_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
-                (epoch >= dp.hard_prune_from_epoch and epoch % dp.hard_prune_epoch_interval == 0)
+                (epoch >= dp.densify_from and epoch < dp.densify_until) and
+                (epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
+                (dp.hard_prune and epoch == dp.densify_until)
             )
+
             scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype) if prune_bool else None
             if prune_bool:
                 print(f"Start soft/hard pruning at epoch {epoch} ####")
@@ -321,6 +328,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         _densify_t0 = time.perf_counter()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
+        if dp.hard_prune and epoch == dp.densify_until and pp.cluster_size > 0:
+            with torch.no_grad():
+                cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
         torch.cuda.synchronize()
         densification_pruning_time = (time.perf_counter() - _densify_t0) * 1000 + _epoch_score_accum_ms
         _all_densify_ms.append(densification_pruning_time)

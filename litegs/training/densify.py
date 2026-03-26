@@ -189,20 +189,17 @@ class DensityControllerOfficial(DensityControllerBase):
         elif scores.shape[0] > N:
             raise RuntimeError("scores should not have more elements than the number of Gaussians in the model!")
 
-        prune_mask_litegs=self.get_prune_mask(opacity.sigmoid(),scale.exp())
-        prune_mask=torch.logical_or(prune_mask_speedy,prune_mask_litegs)
-
-        if prune_mask.sum() > 0.9 * opacity.shape[-1]:
+        if prune_mask_speedy.sum() > 0.9 * opacity.shape[-1]:
             raise RuntimeError("Pruning would remove >90% of Gaussians")
         if self.bCluster:
-            N=prune_mask.sum()
+            N=prune_mask_speedy.sum()
             chunk_num=int(N/chunk_size)
             del_limit=chunk_num*chunk_size
-            del_indices=prune_mask.nonzero()[:del_limit,0]
-            prune_mask=torch.zeros_like(prune_mask)
-            prune_mask[del_indices]=True
-        self._prune_optimizer(~prune_mask,optimizer)
-        del prune_mask
+            del_indices=prune_mask_speedy.nonzero()[:del_limit,0]
+            prune_mask_speedy=torch.zeros_like(prune_mask_speedy)
+            prune_mask_speedy[del_indices]=True
+        self._prune_optimizer(~prune_mask_speedy,optimizer)
+        del prune_mask_speedy
         return
     
     # for g in optimizer.param_groups:
@@ -305,15 +302,24 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
+    def is_stats_needed(self,epoch:int):
+        return self.is_densify_actived(epoch) or (
+            self.densify_params.hard_prune and
+            epoch == self.densify_params.densify_until
+        )
+
+    @torch.no_grad()
     def step(self,optimizer:torch.optim.Optimizer,epoch:int,iteration:int,scores,num_training_views):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
+                
                 self.split_and_clone(optimizer,epoch)
 
                 # Speedy-Splat soft pruning during densification
+                # if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
+                #     (epoch % self.densify_params.soft_prune_epoch_interval == self.densify_params.soft_prune_epoch_interval - 1):
                 if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
-                    (epoch < self.densify_params.hard_prune_from_epoch) and \
                     (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
                     self.prune_speedysplat(optimizer,scores,iteration)
@@ -324,18 +330,16 @@ class DensityControllerOfficial(DensityControllerBase):
                 bUpdate=True
             if bUpdate:
                 xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-                StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+                StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_stats_needed)
                 torch.cuda.empty_cache()
 
         # Speedy-Splat hard pruning after densification
-        if  (epoch >= self.densify_params.hard_prune_from_epoch) and \
-            (epoch % self.densify_params.hard_prune_epoch_interval == 0):
-
+        if (self.densify_params.hard_prune and epoch == self.densify_params.densify_until):
             print(f"Hard pruning at epoch {epoch} ####")
             self.prune_speedysplat(optimizer,scores,iteration)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-            StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
+            StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_stats_needed)
             torch.cuda.empty_cache()
             
 
@@ -356,7 +360,10 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         if self.densify_params.prune_mode == 'weight': # LiteGS uses 'weight' as default
             prune_mask=torch.zeros(actived_opacity.shape[1],device=actived_opacity.device).bool()
 
-            frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
+            result=StatisticsHelperInst.get_mean('fragment_weight')
+            if result is None:
+                return super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)
+            frag_weight,frag_count=result
             weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
             invisible = weight_sum==0 # TODO: Change this back?? weight_sum<(weight_sum[weight_sum!=0].quantile(0.05)) 
             prune_mask[:invisible.shape[0]]|=invisible

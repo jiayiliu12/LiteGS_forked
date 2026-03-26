@@ -98,19 +98,16 @@ class DensifyParams(ParamGroup):
     opacity_reset_mode='decay'#'decay','reset'
 
     prune_mode='weight'#'weight','threshold'
-    soft_prune_from_epoch = 3 #1 #8
-    hard_prune_from_epoch = 10000 #1 #8
-    soft_prune_epoch_interval = 5 #1 #5
-    hard_prune_epoch_interval = 10 #1 #5
-    soft_prune_ratio = 0.4
-    hard_prune_ratio = 0.2 # 0.3
+    soft_prune_from_epoch = 13 #1 #8
+    hard_prune = True
+    soft_prune_epoch_interval = 5
 
     # Goal for densification
     target_primitives=1000000
     
     mass_threshold = 0.94
 
-    verbosity = False # False to disable irrelevant WandB logs in trainer.py and densify.py. Only shows: final Testing PSNR, Testing SSIM, Gaussian count, render time, rasterize time, backward time, and total time.
+    verbosity = True # False to disable irrelevant WandB logs in trainer.py and densify.py. Only shows: final Testing PSNR, Testing SSIM, Gaussian count, render time, rasterize time, backward time, and total time.
 
     #discard
     densify_grad_threshold = 0.00015
