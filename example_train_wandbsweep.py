@@ -29,26 +29,20 @@ if __name__ == "__main__":
     # 2: Define the search space
     sweep_configuration = {
         "method": "bayes",
-        "metric": {"goal": "maximize", "name": "test/psnr_Testset"},
+        "metric": {"goal": "maximize", "name": "sweep/objective_Testset"},
         "parameters": {
-            "soft_prune_ratio": {"max": 0.4, "min":0.0},
-            "hard_prune_ratio": {"max": 0.5, "min":0.1},
-            "soft_prune_epoch_interval": {"max":20, "min":5},
-            "hard_prune_epoch_interval": {"max":10, "min":5},
-            # "": {"max":, "min":},
-            # "": {"max":, "min":},
+            "mass_threshold": {"max": 0.95, "min": 0.4},
+            "lambda_s": {"max": 1.0, "min": 0.0},
         },
     }
 
     # 3: Start the sweep
-    sweep_id = wandb.sweep(sweep=sweep_configuration, project="LiteGS")
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project="LiteGS-merged-Speedy")
 
     def wandb_start():
-        run = wandb.init(project="LiteGS")
-        dp.soft_prune_ratio = run.config.soft_prune_ratio
-        dp.hard_prune_ratio = run.config.hard_prune_ratio
-        dp.soft_prune_ratio = run.config.soft_prune_ratio
-        dp.soft_prune_ratio = run.config.soft_prune_ratio
+        run = wandb.init(project="LiteGS-merged-Speedy")
+        dp.mass_threshold = run.config.mass_threshold
+        dp.lambda_s = run.config.lambda_s
 
         litegs.training.start(lp,op,pp,dp,args.test_epochs,args.save_epochs,args.checkpoint_epochs,args.start_checkpoint)
 

@@ -143,12 +143,12 @@ class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
     def get_prune_mask_score_mass(self, scores: torch.Tensor, iteration: int, opacity: torch.Tensor, max_prune_ratio: float = 0.85) -> torch.Tensor:
         lambda_s = self.densify_params.lambda_s
-        lambda_o = self.densify_params.lambda_o
 
-        # Normalize t between [0,1]
-        def _minmax(t: torch.Tensor) -> torch.Tensor:
-            t_min, t_max = t.min(), t.max()
-            return (t - t_min) / (t_max - t_min + 1e-8)
+        def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99) -> torch.Tensor:
+            t_lo = torch.quantile(t, lo)
+            t_hi = torch.quantile(t, hi)
+            t_clipped = t.clamp(t_lo, t_hi)
+            return (t_clipped - t_lo) / (t_hi - t_lo + 1e-8)
 
         weighted_scores = lambda_s * _robust_minmax(scores) + (1 - lambda_s) * _robust_minmax(opacity.squeeze())
         sorted_scores, sorted_idx = torch.sort(weighted_scores, descending=True)
