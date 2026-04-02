@@ -150,7 +150,7 @@ class DensityControllerOfficial(DensityControllerBase):
             t_min, t_max = t.min(), t.max()
             return (t - t_min) / (t_max - t_min + 1e-8)
 
-        weighted_scores = lambda_s * _minmax(scores) + lambda_o * _minmax(opacity.squeeze())
+        weighted_scores = lambda_s * _robust_minmax(scores) + (1 - lambda_s) * _robust_minmax(opacity.squeeze())
         sorted_scores, sorted_idx = torch.sort(weighted_scores, descending=True)
 
         cumsum = sorted_scores.cumsum(0) / sorted_scores.sum()

@@ -11,7 +11,7 @@ import time
 import matplotlib.pyplot as plt
 import json
 import wandb
-
+from .lpipsPyTorch import lpips
 
 from .. import arguments
 from .. import data
@@ -264,6 +264,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_list=[]
                     psnr_list=[]
                     ssim_list=[]
+                    lpips_list=[]
                     logged_images = []
                     num_log_images = 6
                     # Pick 6 evenly-spaced frame indices across the loader
@@ -292,6 +293,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
+                        lpips_list.append(lpips(img,gt_image).unsqueeze(0))
 
                         # --- Wandb image logging ---
                         # img and gt_image are [1, 3, H, W] tensors in [0, 1].
@@ -310,6 +312,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 )
 
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
+                    lpips_mean=torch.concat(lpips_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
 
@@ -317,6 +320,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
+                        f"test/lpips_{name}" : lpips_mean.item(),
                     }, iteration)
                     if VERBOSE:
                         if name=="Testset":
