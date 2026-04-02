@@ -26,6 +26,6 @@ if __name__ == "__main__":
     pp=litegs.arguments.PipelineParams.extract(args)
     dp=litegs.arguments.DensifyParams.extract(args)
 
-    wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
+    wandb.init(project="LiteGS-merged-Speedy", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
 
     litegs.training.start(lp,op,pp,dp,args.test_epochs,args.save_epochs,args.checkpoint_epochs,args.start_checkpoint)

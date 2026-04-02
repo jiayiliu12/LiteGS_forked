@@ -141,8 +141,18 @@ class DensityControllerOfficial(DensityControllerBase):
         return selected_pts_mask
     
     @torch.no_grad()
-    def get_prune_mask_score_mass(self, scores: torch.Tensor, iteration: int, max_prune_ratio: float = 0.85) -> torch.Tensor:
-        sorted_scores, sorted_idx = torch.sort(scores, descending=True)
+    def get_prune_mask_score_mass(self, scores: torch.Tensor, iteration: int, opacity: torch.Tensor, max_prune_ratio: float = 0.85) -> torch.Tensor:
+        lambda_s = self.densify_params.lambda_s
+        lambda_o = self.densify_params.lambda_o
+
+        # Normalize t between [0,1]
+        def _minmax(t: torch.Tensor) -> torch.Tensor:
+            t_min, t_max = t.min(), t.max()
+            return (t - t_min) / (t_max - t_min + 1e-8)
+
+        weighted_scores = lambda_s * _minmax(scores) + lambda_o * _minmax(opacity.squeeze())
+        sorted_scores, sorted_idx = torch.sort(weighted_scores, descending=True)
+
         cumsum = sorted_scores.cumsum(0) / sorted_scores.sum()
         keep_mass = self.densify_params.mass_threshold
         keep_count = (cumsum < keep_mass).sum() + 1
@@ -180,7 +190,7 @@ class DensityControllerOfficial(DensityControllerBase):
         # scores = scores / frag_count.clamp(min=1).sqrt()
 
         # Prune_mask: shape [N], bool, on GPU
-        prune_mask_speedy=self.get_prune_mask_score_mass(scores, iteration, max_prune_ratio=0.85)
+        prune_mask_speedy=self.get_prune_mask_score_mass(scores, iteration, opacity[:,:scores.shape[0]], max_prune_ratio=0.85)
                 
         # Append ones to scores to match the new number of Gaussians after densification!
         N = xyz.shape[-1]

@@ -99,13 +99,15 @@ class DensifyParams(ParamGroup):
 
     prune_mode='weight'#'weight','threshold'
     soft_prune_from_epoch = 13 #1 #8
-    hard_prune = True
+    hard_prune = False
     soft_prune_epoch_interval = 5
 
     # Goal for densification
     target_primitives=1000000
     
     mass_threshold = 0.94
+    lambda_s = 0.9
+    lambda_o = 0.1
 
     verbosity = True # False to disable irrelevant WandB logs in trainer.py and densify.py. Only shows: final Testing PSNR, Testing SSIM, Gaussian count, render time, rasterize time, backward time, and total time.
 
