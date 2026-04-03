@@ -40,10 +40,10 @@ if __name__ == "__main__":
     sweep_id = wandb.sweep(sweep=sweep_configuration, project="LiteGS-merged-Speedy")
 
     def wandb_start():
-        run = wandb.init(project="LiteGS-merged-Speedy")
+        run = wandb.init(project="LiteGS-merged-Speedy", dir="/capstor/scratch/cscs/ljiayi/LiteGS_wandb")
         dp.mass_threshold = run.config.mass_threshold
         dp.lambda_s = run.config.lambda_s
 
         litegs.training.start(lp,op,pp,dp,args.test_epochs,args.save_epochs,args.checkpoint_epochs,args.start_checkpoint)
 
-    wandb.agent(sweep_id, function=wandb_start, count=25)
+    wandb.agent(sweep_id, function=wandb_start, count=20)
