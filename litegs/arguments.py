@@ -107,6 +107,7 @@ class DensifyParams(ParamGroup):
     
     mass_threshold = 0.94
     lambda_s = 0.9 # 90% speedy-splat and 10% opacity
+    morton_gap_alpha = 0.5
 
     verbosity = True # False to disable irrelevant WandB logs in trainer.py and densify.py. Only shows: final Testing PSNR, Testing SSIM, Gaussian count, render time, rasterize time, backward time, and total time.
 

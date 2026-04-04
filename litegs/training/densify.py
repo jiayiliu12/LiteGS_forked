@@ -4,6 +4,7 @@ import wandb
 from ..arguments import DensifyParams
 from ..utils.statistic_helper import StatisticsHelperInst
 from ..scene import cluster
+from ..scene.point import _gen_morton_code
 from ..utils import wrapper
 
 class DensityControllerBase:
@@ -382,7 +383,33 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         
         return prune_mask
     
-    def get_score(self,xyz,scale,rot,sh_0,sh_rest,opacity)->torch.Tensor:
+    def compute_morton_gap_weight(self, xyz: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+        codes = _gen_morton_code(xyz)
+        sorted_codes, indices = codes.sort(stable=True)
+
+        gap_left  = torch.cat([sorted_codes[1:2] - sorted_codes[:1],
+                            sorted_codes[1:] - sorted_codes[:-1]]).float()
+        gap_right = torch.cat([sorted_codes[1:] - sorted_codes[:-1],
+                            sorted_codes[-1:] - sorted_codes[-2:-1]]).float()
+
+        local_gap = torch.maximum(gap_left, gap_right)
+        local_gap = local_gap / (local_gap.quantile(0.95) + 1e-8)  # robust normalize
+
+        gap_weights = torch.empty_like(local_gap)
+        gap_weights[indices] = local_gap
+        return gap_weights.clamp(0, 3.0)
+
+    def get_score(self, xyz, scale, rot, sh_0, sh_rest, opacity):
+        print("new morton densification score!!! ###")
+        var, frag_count = StatisticsHelperInst.get_var('fragment_err')
+        score = var * frag_count * (opacity.sigmoid() ** 2)
+        score = score.squeeze().nan_to_num(0).clamp_min_(0)
+
+        gap_w = self.compute_morton_gap_weight(xyz)
+        score = score * (1.0 + self.densify_params.morton_gap_alpha * gap_w)
+        return score
+    
+    def get_score_old(self,xyz,scale,rot,sh_0,sh_rest,opacity)->torch.Tensor:
         var,frag_count=StatisticsHelperInst.get_var('fragment_err')
         #score=(var*frag_count).sqrt()*(opacity.sigmoid())
         score=var*frag_count*(opacity.sigmoid()*opacity.sigmoid())
