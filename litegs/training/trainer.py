@@ -312,7 +312,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 )
 
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
-                    lpips_mean=torch.concat(lpips_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
                     # lpips_mean=torch.concat(lpips_list,dim=0).mean()
