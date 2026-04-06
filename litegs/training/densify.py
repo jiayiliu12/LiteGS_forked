@@ -443,6 +443,21 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         return
     
     @torch.no_grad()
+    def calibrate_from_first_epoch(self, train_psnr: float, train_ssim: float) -> None:
+        # Sets self._calibrated_keep_ratio and self._calibrated on this object
+        super().calibrate_from_first_epoch(train_psnr, train_ssim)
+
+        # Adaptive densification target — needs self.target_points_num from this class
+        _MIN_TARGET = 600_000
+        self._adaptive_target_primitives = int(
+            _MIN_TARGET + (self.target_points_num - _MIN_TARGET) * self._calibrated_keep_ratio
+        )
+        wandb.log({
+            "densify/adaptive_target_primitives": self._adaptive_target_primitives,
+            "densify/original_target_primitives": self.target_points_num,
+        }, 0)
+    
+    @torch.no_grad()
     def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
         if self.densify_params.prune_mode == 'weight': # LiteGS uses 'weight' as default
             prune_mask=torch.zeros(actived_opacity.shape[1],device=actived_opacity.device).bool()
@@ -475,8 +490,19 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1),xyz.shape[-1])
+        # Use adaptive target if calibrated, else fall back to configured target.
+        # Calibration fires after epoch 0, well before densification starts.
+        effective_target = getattr(self, "_adaptive_target_primitives", self.target_points_num)
+        cur_target_count = (
+            (effective_target - self.init_points_num)
+            / (self.densify_params.densify_until - self.densify_params.densify_from)
+            * (epoch - self.densify_params.densify_from)
+            + self.init_points_num
+        )
+        budget = min(max(int(cur_target_count - xyz.shape[-1]), 1), xyz.shape[-1])
+
+        # cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
+        # budget=min(max(int(cur_target_count-xyz.shape[-1]),1),xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
         densify_index = torch.multinomial(score, budget, replacement=False)
