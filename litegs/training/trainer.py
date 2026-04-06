@@ -146,9 +146,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             densification_pruning_time=0
 
             prune_bool = (
-                (epoch >= dp.densify_from and epoch < dp.densify_until) and
-                (epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
-                (dp.hard_prune and epoch == dp.densify_until)
+                (epoch >= dp.densify_from and epoch < dp.densify_until and
+                epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
+                (dp.hard_prune and epoch >= dp.densify_until and
+                (epoch - dp.densify_until) % dp.hard_prune_epoch_interval == 0)
             )
 
             scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype) if prune_bool else None
@@ -273,7 +274,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 "train/ssim": _epoch_avg_ssim,
             }, iteration)
 
-            if epoch == 0:
+            if epoch == 12:
                 density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim)
 
             _epoch_train_psnr_sum = 0.0
@@ -367,7 +368,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         _densify_t0 = time.perf_counter()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
-        if dp.hard_prune and epoch == dp.densify_until and pp.cluster_size > 0:
+        if (dp.hard_prune and epoch >= dp.densify_until and (epoch - dp.densify_until) % dp.hard_prune_epoch_interval == 0 and pp.cluster_size > 0):
             with torch.no_grad():
                 cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
         torch.cuda.synchronize()

@@ -224,15 +224,30 @@ class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
     def prune_speedysplat(
         self,
-        optimizer:  torch.optim.Optimizer,
-        scores:     torch.Tensor,
-        iteration:  int,
+        optimizer:     torch.optim.Optimizer,
+        scores:        torch.Tensor,
+        iteration:     int,
+        is_hard_prune: bool = False,
     ) -> None:
         if not getattr(self, "_calibrated", False):
             raise RuntimeError(
-                "calibrate_from_first_epoch() must be called before pruning. "
-                "Make sure your first pruning epoch comes after epoch 0."
+                "calibrate_from_first_epoch() must be called before pruning."
             )
+
+        # Hard prune uses strength multiplier; soft prune uses calibrated ratio as-is.
+        # Clamp so we never go below 0.10 (always keep at least 10% of Gaussians)
+        # or above 0.95 (always prune at least 5%).
+        if is_hard_prune:
+            keep_ratio = float(max(0.10, min(0.95,
+                self._calibrated_keep_ratio * self.densify_params.hard_prune_strength
+            )))
+        else:
+            keep_ratio = self._calibrated_keep_ratio
+
+        wandb.log({
+            "score_mass/is_hard_prune":  int(is_hard_prune),
+            "score_mass/keep_ratio_used": keep_ratio,
+        }, iteration)
 
         xyz, scale, rot, sh_0, sh_rest, opacity = self._get_params_from_optimizer(optimizer)
         chunk_size = 1
@@ -247,10 +262,9 @@ class DensityControllerOfficial(DensityControllerBase):
             scores     = scores,
             iteration  = iteration,
             opacity    = opacity[:, :scores.shape[0]],
-            keep_ratio = self._calibrated_keep_ratio,
+            keep_ratio = keep_ratio,
         )
 
-        # New Gaussians added by densification this epoch have no score → always keep
         if prune_mask.shape[0] < N:
             prune_mask = torch.cat([
                 prune_mask,
@@ -263,7 +277,7 @@ class DensityControllerOfficial(DensityControllerBase):
         if n_pruned > 0.9 * N:
             raise RuntimeError(
                 f"Would prune {n_pruned}/{N} Gaussians. "
-                f"keep_ratio={self._calibrated_keep_ratio:.3f}"
+                f"keep_ratio={keep_ratio:.3f}, is_hard_prune={is_hard_prune}"
             )
 
         if self.bCluster:
@@ -375,10 +389,11 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def is_stats_needed(self,epoch:int):
+    def is_stats_needed(self, epoch: int):
         return self.is_densify_actived(epoch) or (
             self.densify_params.hard_prune and
-            epoch == self.densify_params.densify_until
+            epoch >= self.densify_params.densify_until and
+            (epoch - self.densify_params.densify_until) % self.densify_params.hard_prune_epoch_interval == 0
         )
 
     @torch.no_grad()
@@ -405,14 +420,15 @@ class DensityControllerOfficial(DensityControllerBase):
                 torch.cuda.empty_cache()
 
         # Speedy-Splat hard pruning after densification
-        if (self.densify_params.hard_prune and epoch == self.densify_params.densify_until):
+        if (self.densify_params.hard_prune and
+        epoch >= self.densify_params.densify_until and
+        (epoch - self.densify_params.densify_until) % self.densify_params.hard_prune_epoch_interval == 0):
             print(f"Hard pruning at epoch {epoch} ####")
-            self.prune_speedysplat(optimizer,scores,iteration)
+            self.prune_speedysplat(optimizer, scores, iteration, is_hard_prune=True)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
             StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_stats_needed)
             torch.cuda.empty_cache()
-            
 
         return self._get_params_from_optimizer(optimizer)
     
