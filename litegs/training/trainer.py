@@ -42,7 +42,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     
     cameras_info:dict[int,data.CameraInfo]=None
     camera_frames:list[data.ImageFrame]=None
-    cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
+    cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)
 
     #preload
     for camera_frame in camera_frames:
@@ -57,8 +57,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 test_frames=[c for c in camera_frames if c.name in train_test_split["test"]]
         else:
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
-            # test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
-            test_frames = [camera_frames[idx] for idx in range(0, 40, 8)] # ensures 5 testing imgs, which are idx % 8
+            test_frames = [camera_frames[idx] for idx in range(0, 40, 8)]
     else:
         training_frames=camera_frames
         test_frames=None
@@ -99,7 +98,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         noise_extr=torch.cat([frame.extr_params[None,:] for frame in trainingset.frames])
         denoised_training_extr=torch.nn.Embedding(noise_extr.shape[0],noise_extr.shape[1],_weight=noise_extr.clone(),sparse=True)
         noise_intr=torch.tensor(list(trainingset.cameras.values())[0].intr_params,dtype=torch.float32,device='cuda').unsqueeze(0)
-        denoised_training_intr=torch.nn.Parameter(torch.tensor(list(trainingset.cameras.values())[0].intr_params,dtype=torch.float32,device='cuda').unsqueeze(0))#todo fix multi cameras
+        denoised_training_intr=torch.nn.Parameter(torch.tensor(list(trainingset.cameras.values())[0].intr_params,dtype=torch.float32,device='cuda').unsqueeze(0))
         view_opt=torch.optim.SparseAdam(denoised_training_extr.parameters(),lr=1e-4)
         proj_opt=torch.optim.Adam([denoised_training_intr,],lr=1e-5)
 
@@ -120,8 +119,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     # benchmark accumulators
     _WARMUP_ITERS = min(100, max(10, op.iterations // 300))
-    _all_iter_ms: list[float] = []    # wall-clock time per training iteration
-    _all_densify_ms: list[float] = [] # wall-clock time per densification step
+    _all_iter_ms: list[float] = []
+    _all_densify_ms: list[float] = []
+
+    # ── Adaptive pruning: per-epoch training metric accumulators ──────────────
+    # We reuse img and gt_image that are already computed in the training loop —
+    # no extra forward passes. ssim is free (already in ssim_loss); PSNR is one
+    # cheap metric kernel on already-rendered tensors.
+    _train_psnr_metric = psnr.PeakSignalNoiseRatio(data_range=(0.0, 1.0)).cuda()
+    _epoch_train_psnr_sum = 0.0
+    _epoch_train_ssim_sum = 0.0
+    _epoch_train_n        = 0
+    # ─────────────────────────────────────────────────────────────────────────
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -136,11 +145,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             total_iteration_time=0
             densification_pruning_time=0
 
-            # prune_bool = (
-            #     (epoch >= dp.densify_from and epoch < dp.densify_until) and
-            #     (epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == dp.soft_prune_epoch_interval - 1) or
-            #     (dp.hard_prune and epoch == dp.densify_until) # Only hard prune once after densification!
-            # )
             prune_bool = (
                 (epoch >= dp.densify_from and epoch < dp.densify_until) and
                 (epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
@@ -165,7 +169,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 gt_image=gt_image.cuda()/255.0
                 idx=idx.cuda()
                 if op.learnable_viewproj:
-                    #fix view matrix
                     extr=denoised_training_extr(idx)
                     intr=denoised_training_intr
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
@@ -198,7 +201,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 backward_end.record()
 
                 if StatisticsHelperInst.bStart:
-                    StatisticsHelperInst.backward_callback()
+                    StatisticsHelperInst.backward_callback() 
                 if pp.sparse_grad:
                     opt.step(visible_chunkid,primitive_visible)
                 else:
@@ -207,11 +210,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if op.learnable_viewproj:
                     view_opt.step()
                     view_opt.zero_grad()
-                    # proj_opt.step()
-                    # proj_opt.zero_grad()
                 schedular.step()
 
-                
+                # ── Accumulate per-iteration train metrics for adaptive pruning ──
+                # ssim_loss = 1 - SSIM, so SSIM = 1 - ssim_loss.item(). Free.
+                # PSNR: one cheap metric kernel on already-rendered img. No re-render.
+                with torch.no_grad():
+                    _epoch_train_ssim_sum += 1.0 - ssim_loss.item()
+                    _epoch_train_psnr_sum += _train_psnr_metric(img.detach(), gt_image).item()
+                    _epoch_train_n        += 1
+                # ─────────────────────────────────────────────────────────────────
+
                 torch.cuda.synchronize()
                 _iter_ms = (time.perf_counter() - _iter_t0) * 1000
                 _all_iter_ms.append(_iter_ms)
@@ -249,6 +258,28 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 
                 iteration+=1
 
+        # ── End of epoch: compute averages, calibrate pruning, reset accumulators ──
+        # Calibration happens once after epoch 0 — the first time every training
+        # view has been seen. At that point PSNR and SSIM already clearly separate
+        # simple from complex scenes (visible in your WandB plots at step 2k).
+        # Pruning only starts at soft_prune_from_epoch which is always > 0, so
+        # calibrate_from_first_epoch is guaranteed to fire before any pruning.
+        if _epoch_train_n > 0:
+            _epoch_avg_psnr = _epoch_train_psnr_sum / _epoch_train_n
+            _epoch_avg_ssim = _epoch_train_ssim_sum / _epoch_train_n
+
+            wandb.log({
+                "train/psnr": _epoch_avg_psnr,
+                "train/ssim": _epoch_avg_ssim,
+            }, iteration)
+
+            if epoch == 0:
+                density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim)
+
+            _epoch_train_psnr_sum = 0.0
+            _epoch_train_ssim_sum = 0.0
+            _epoch_train_n        = 0
+        # ──────────────────────────────────────────────────────────────────────────
 
         if epoch in test_epochs or epoch==total_epoch-1:
             with torch.no_grad():
@@ -264,10 +295,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_list=[]
                     psnr_list=[]
                     ssim_list=[]
-                    # lpips_list=[]
                     logged_images = []
                     num_log_images = 6
-                    # Pick 6 evenly-spaced frame indices across the loader
                     log_indices = set(np.linspace(0, len(loader) - 1, num_log_images, dtype=int).tolist())
                     for batch_i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(loader):
                         view_matrix=view_matrix.cuda()
@@ -277,7 +306,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         idx=idx.cuda()
                         if op.learnable_viewproj:
                             if name=="Trainingset":
-                                #fix view matrix
                                 extr=denoised_training_extr(idx)
                                 intr=denoised_training_intr
                             else:
@@ -286,23 +314,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 extr=extr+delta
                             view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
 
-                        #cluster culling
                         visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
                         img,transmitance,depth,normal,primitive_visible,elapsed_times=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                                     actived_sh_degree,gt_image.shape[2:],pp)
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
-                        # lpips_list.append(lpips(img,gt_image).unsqueeze(0))
 
-                        # --- Wandb image logging ---
-                        # img and gt_image are [1, 3, H, W] tensors in [0, 1].
-                        # We build a side-by-side panel: rendered (left) | GT (right).
                         if VERBOSE: 
                             if name == "Testset" and batch_i in log_indices:
-                                rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()   # [H, W, 3]
+                                rendered_np = img[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                                 gt_np       = gt_image[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
-                                panel       = np.concatenate([rendered_np, gt_np], axis=1)          # [H, 2W, 3]
+                                panel       = np.concatenate([rendered_np, gt_np], axis=1)
                                 panel_uint8 = (panel * 255).astype(np.uint8)
                                 logged_images.append(
                                     wandb.Image(
@@ -314,26 +337,22 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
-                    # lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
                     MAX_GAUSSIANS = 1_000_000
                     MAX_PSNR = 30.0
 
                     _gaussian_count = xyz.shape[1] * xyz.shape[2]
 
-                    # Normalize each metric to [0, 1]
-                    _psnr_score    = psnr_mean.item() / MAX_PSNR          # higher = better
-                    _density_score = 1.0 - (_gaussian_count / MAX_GAUSSIANS) # lower count = higher score
+                    _psnr_score    = psnr_mean.item() / MAX_PSNR
+                    _density_score = 1.0 - (_gaussian_count / MAX_GAUSSIANS)
 
-                    # Combined objective (tune alpha to weight PSNR vs sparsity)
-                    _alpha = 0.7  # 70% PSNR, 30% sparsity
+                    _alpha = 0.7
                     _sweep_objective = _alpha * _psnr_score + (1.0 - _alpha) * _density_score
 
                     wandb.log({
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                        # f"test/lpips_{name}" : lpips_mean.item(),
                         f"sweep/objective_{name}" : _sweep_objective,
                         f"sweep/psnr_score_{name}"    : _psnr_score,
                         f"sweep/density_score_{name}" : _density_score,
@@ -341,7 +360,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     if VERBOSE:
                         if name=="Testset":
                             wandb.log({
-                                f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
+                                f"test/renders_{name}" : logged_images,
                             }, iteration)
                             
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
@@ -390,7 +409,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     # --- Benchmark Summary ---
     _bench_iters = np.array(_all_iter_ms[_WARMUP_ITERS:]) if len(_all_iter_ms) > _WARMUP_ITERS else np.array(_all_iter_ms)
     _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
-    _total_iter_s    = np.array(_all_iter_ms).sum() / 1000   # includes warmup
+    _total_iter_s    = np.array(_all_iter_ms).sum() / 1000
     _total_densify_s = _densify_arr.sum() / 1000
 
     _gpu_name = torch.cuda.get_device_name(0)

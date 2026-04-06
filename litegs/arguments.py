@@ -103,7 +103,7 @@ class DensifyParams(ParamGroup):
     soft_prune_epoch_interval = 5
 
     # Goal for densification
-    target_primitives=1000000
+    target_primitives=2000000
     
     mass_threshold = 0.94
     lambda_s = 0.9 # 90% speedy-splat and 10% opacity
