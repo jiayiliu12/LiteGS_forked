@@ -1,5 +1,6 @@
 import torch
 import wandb
+import math
 
 from ..arguments import DensifyParams
 from ..utils.statistic_helper import StatisticsHelperInst
@@ -140,78 +141,155 @@ class DensityControllerOfficial(DensityControllerBase):
         large_pts_mask = actived_scale.max(dim=0).values > self.percent_dense*self.screen_extent
         selected_pts_mask=abnormal_mask&large_pts_mask
         return selected_pts_mask
-    
+
     @torch.no_grad()
-    def get_prune_mask_score_mass(self, scores: torch.Tensor, iteration: int, opacity: torch.Tensor, max_prune_ratio: float = 0.85) -> torch.Tensor:
+    def calibrate_from_first_epoch(
+        self,
+        train_psnr: float,
+        train_ssim: float,
+        iteration: int
+    ) -> None:
+        """
+        Called exactly once, after the first full epoch.
+        
+        SSIM after 1 epoch is the ideal complexity proxy:
+        - Already in [0, 1], no normalisation needed
+        - High SSIM (0.78 in your simple scene) → scene is easy → prune hard
+        - Low  SSIM (0.35 in your complex scenes) → scene needs Gaussians → keep more
+        
+        keep_ratio = 1 - ssim_epoch1 is the entire formula.
+        Simple: 1 - 0.78 = 0.22 → keep 22%, prune 78%
+        Complex A: 1 - 0.52 = 0.48 → keep 48%
+        Complex B: 1 - 0.35 = 0.65 → keep 65%
+        
+        PSNR is used as a secondary consistency check — averaged with SSIM signal
+        to be more robust to outlier frames.
+        """
+        # SSIM signal: already in [0,1]
+        ssim_keep = 1.0 - float(train_ssim)
+
+        # PSNR signal: clip to [15, 35] — the realistic range after exactly 1 epoch
+        # of 3DGS training. Not scene-specific; just physically grounded.
+        psnr_norm = (max(15.0, min(35.0, float(train_psnr))) - 15.0) / 20.0
+        psnr_keep = 1.0 - psnr_norm   # high PSNR → simple → prune more → low keep
+
+        self._calibrated_keep_ratio = float(
+            max(0.10, min(0.95, 0.5 * ssim_keep + 0.5 * psnr_keep))
+        )
+        self._calibrated = True
+
+        wandb.log({
+            "score_mass/calibrated_keep_ratio": self._calibrated_keep_ratio,
+            "score_mass/calibration_psnr":      train_psnr,
+            "score_mass/calibration_ssim":      train_ssim,
+        }, iteration)
+
+    @torch.no_grad()
+    def get_prune_mask_score_mass(
+        self,
+        scores:     torch.Tensor,
+        iteration:  int,
+        opacity:    torch.Tensor,
+        keep_ratio: float,              # ← now required; no longer reads mass_threshold
+    ) -> torch.Tensor:
+        """
+        Keeps the top-keep_ratio fraction of Gaussians by weighted score.
+        """
         lambda_s = self.densify_params.lambda_s
 
-        def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99) -> torch.Tensor:
-            t_lo = torch.quantile(t, lo)
-            t_hi = torch.quantile(t, hi)
-            t_clipped = t.clamp(t_lo, t_hi)
-            return (t_clipped - t_lo) / (t_hi - t_lo + 1e-8)
+        def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99):
+            lo_v = torch.quantile(t, lo)
+            hi_v = torch.quantile(t, hi)
+            return (t.clamp(lo_v, hi_v) - lo_v) / (hi_v - lo_v + 1e-8)
 
-        weighted_scores = lambda_s * _robust_minmax(scores) + (1 - lambda_s) * _robust_minmax(opacity.squeeze())
-        sorted_scores, sorted_idx = torch.sort(weighted_scores, descending=True)
+        weighted = (
+            lambda_s       * _robust_minmax(scores)
+            + (1 - lambda_s) * _robust_minmax(opacity.squeeze())
+        )
+        sorted_scores, sorted_idx = torch.sort(weighted, descending=True)
 
-        cumsum = sorted_scores.cumsum(0) / sorted_scores.sum()
-        keep_mass = self.densify_params.mass_threshold
-        keep_count = (cumsum < keep_mass).sum() + 1
-
-        # Safety cap: never prune more than max_prune_ratio of Gaussians
-        min_keep = int((1 - max_prune_ratio) * scores.shape[0])
-        keep_count = max(keep_count, min_keep)
+        keep_count = max(1, int(keep_ratio * scores.shape[0]))
 
         prune_mask = torch.ones(scores.shape[0], device=scores.device, dtype=torch.bool)
         prune_mask[sorted_idx[:keep_count]] = False
 
         wandb.log({
-                "score_mass/keep_ratio": keep_count / scores.shape[0],
-                "score_mass/threshold": sorted_scores[keep_count - 1].item(),
-            }, iteration)
-
-        if self.densify_params.verbosity:
-            wandb.log({
-                "score_mass/keep_count": keep_count,
-                "score_mass/total_count": scores.shape[0],
-            }, iteration)
+            "score_mass/keep_ratio_target": keep_ratio,
+            "score_mass/keep_ratio_actual": keep_count / scores.shape[0],
+            "score_mass/keep_count":        keep_count,
+            "score_mass/total_count":       scores.shape[0],
+            "score_mass/threshold":         sorted_scores[keep_count - 1].item(),
+        }, iteration)
 
         return prune_mask
-
+    
     @torch.no_grad()
-    def prune_speedysplat(self,optimizer:torch.optim.Optimizer,scores,iteration):
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
-        chunk_size=1
+    def prune_speedysplat(
+        self,
+        optimizer:     torch.optim.Optimizer,
+        scores:        torch.Tensor,
+        iteration:     int,
+        is_hard_prune: bool = False,
+    ) -> None:
+        if not getattr(self, "_calibrated", False):
+            raise RuntimeError(
+                "calibrate_from_first_epoch() must be called before pruning."
+            )
+
+        # Hard prune uses strength multiplier; soft prune uses calibrated ratio as-is.
+        # Clamp so we never go below 0.10 (always keep at least 10% of Gaussians)
+        # or above 0.95 (always prune at least 5%).
+        if is_hard_prune:
+            keep_ratio = float(max(0.10, min(0.95,
+                self._calibrated_keep_ratio * self.densify_params.hard_prune_strength
+            )))
+        else:
+            keep_ratio = self._calibrated_keep_ratio
+
+        wandb.log({
+            "score_mass/is_hard_prune":  int(is_hard_prune),
+            "score_mass/keep_ratio_used": keep_ratio,
+        }, iteration)
+
+        xyz, scale, rot, sh_0, sh_rest, opacity = self._get_params_from_optimizer(optimizer)
+        chunk_size = 1
         if self.bCluster:
-            chunk_size=xyz.shape[-1]
-            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+            chunk_size = xyz.shape[-1]
+            xyz, scale, rot, sh_0, sh_rest, opacity = cluster.uncluster(
+                xyz, scale, rot, sh_0, sh_rest, opacity)
 
-        # # NEW: Get mean squared contribution per pixel rather than total contribution. A small Gaussian that's critical at 50 pixels would score higher than a large redundant one at 10k pixels. 
-        # frag_weight,frag_count=StatisticsHelperInst.get_mean('fragment_weight')
-        # scores = scores / frag_count.clamp(min=1).sqrt()
-
-        # Prune_mask: shape [N], bool, on GPU
-        prune_mask_speedy=self.get_prune_mask_score_mass(scores, iteration, opacity[:,:scores.shape[0]], max_prune_ratio=0.85)
-                
-        # Append ones to scores to match the new number of Gaussians after densification!
         N = xyz.shape[-1]
-        if scores.shape[0] < N:
-            prune_mask_speedy = torch.cat([prune_mask_speedy, prune_mask_speedy.new_full((N - scores.shape[0],), False)])
-        elif scores.shape[0] > N:
-            raise RuntimeError("scores should not have more elements than the number of Gaussians in the model!")
 
-        if prune_mask_speedy.sum() > 0.9 * opacity.shape[-1]:
-            raise RuntimeError("Pruning would remove >90% of Gaussians")
+        prune_mask = self.get_prune_mask_score_mass(
+            scores     = scores,
+            iteration  = iteration,
+            opacity    = opacity[:, :scores.shape[0]],
+            keep_ratio = keep_ratio,
+        )
+
+        if prune_mask.shape[0] < N:
+            prune_mask = torch.cat([
+                prune_mask,
+                prune_mask.new_zeros(N - prune_mask.shape[0])
+            ])
+        elif prune_mask.shape[0] > N:
+            raise RuntimeError("scores has more elements than current Gaussians")
+
+        n_pruned = int(prune_mask.sum())
+        if n_pruned > 0.9 * N:
+            raise RuntimeError(
+                f"Would prune {n_pruned}/{N} Gaussians. "
+                f"keep_ratio={keep_ratio:.3f}, is_hard_prune={is_hard_prune}"
+            )
+
         if self.bCluster:
-            N=prune_mask_speedy.sum()
-            chunk_num=int(N/chunk_size)
-            del_limit=chunk_num*chunk_size
-            del_indices=prune_mask_speedy.nonzero()[:del_limit,0]
-            prune_mask_speedy=torch.zeros_like(prune_mask_speedy)
-            prune_mask_speedy[del_indices]=True
-        self._prune_optimizer(~prune_mask_speedy,optimizer)
-        del prune_mask_speedy
-        return
+            del_limit   = (n_pruned // chunk_size) * chunk_size
+            del_indices = prune_mask.nonzero(as_tuple=False)[:del_limit, 0]
+            prune_mask  = torch.zeros_like(prune_mask)
+            prune_mask[del_indices] = True
+
+        self._prune_optimizer(~prune_mask, optimizer)
+
     
     # for g in optimizer.param_groups:
     #     p = g["params"][0]
@@ -313,10 +391,11 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def is_stats_needed(self,epoch:int):
+    def is_stats_needed(self, epoch: int):
         return self.is_densify_actived(epoch) or (
             self.densify_params.hard_prune and
-            epoch == self.densify_params.densify_until
+            epoch >= self.densify_params.densify_until and
+            (epoch - self.densify_params.densify_until) % self.densify_params.hard_prune_epoch_interval == 0
         )
 
     @torch.no_grad()
@@ -328,8 +407,6 @@ class DensityControllerOfficial(DensityControllerBase):
                 self.split_and_clone(optimizer,epoch)
 
                 # Speedy-Splat soft pruning during densification
-                # if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
-                #     (epoch % self.densify_params.soft_prune_epoch_interval == self.densify_params.soft_prune_epoch_interval - 1):
                 if  (epoch >= self.densify_params.soft_prune_from_epoch) and \
                     (epoch % self.densify_params.soft_prune_epoch_interval == 0):
                     print(f"Soft pruning at epoch {epoch} ####")
@@ -345,14 +422,15 @@ class DensityControllerOfficial(DensityControllerBase):
                 torch.cuda.empty_cache()
 
         # Speedy-Splat hard pruning after densification
-        if (self.densify_params.hard_prune and epoch == self.densify_params.densify_until):
+        if (self.densify_params.hard_prune and
+        epoch >= self.densify_params.densify_until and
+        (epoch - self.densify_params.densify_until) % self.densify_params.hard_prune_epoch_interval == 0):
             print(f"Hard pruning at epoch {epoch} ####")
-            self.prune_speedysplat(optimizer,scores,iteration)
+            self.prune_speedysplat(optimizer, scores, iteration, is_hard_prune=True)
 
             xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
             StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_stats_needed)
             torch.cuda.empty_cache()
-            
 
         return self._get_params_from_optimizer(optimizer)
     
@@ -365,6 +443,21 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         self.target_points_num=densify_params.target_primitives
         super(DensityControllerTamingGS,self).__init__(screen_extent,densify_params,bCluster,init_points_num)
         return
+    
+    @torch.no_grad()
+    def calibrate_from_first_epoch(self, train_psnr: float, train_ssim: float, iteration: int) -> None:
+        # Sets self._calibrated_keep_ratio and self._calibrated on this object
+        super().calibrate_from_first_epoch(train_psnr, train_ssim, iteration)
+
+        # Adaptive densification target — needs self.target_points_num from this class
+        _MIN_TARGET = 600_000
+        self._adaptive_target_primitives = int(
+            _MIN_TARGET + (self.target_points_num - _MIN_TARGET) * self._calibrated_keep_ratio
+        )
+        wandb.log({
+            "densify/adaptive_target_primitives": self._adaptive_target_primitives,
+            "densify/original_target_primitives": self.target_points_num,
+        }, iteration)
     
     @torch.no_grad()
     def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
@@ -425,10 +518,18 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
-        prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
-
-        cur_target_count = (self.target_points_num - self.init_points_num) / (self.densify_params.densify_until - self.densify_params.densify_from) * (epoch-self.densify_params.densify_from)+self.init_points_num
-        budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
+        # Use adaptive target if calibrated, else fall back to configured target.
+        # Calibration fires after epoch 0, well before densification starts.
+        effective_target = getattr(self, "_adaptive_target_primitives", self.target_points_num)
+        cur_target_count = (
+            (effective_target - self.init_points_num)
+            / (self.densify_params.densify_until - self.densify_params.densify_from)
+            * (epoch - self.densify_params.densify_from)
+            + self.init_points_num
+        )
+        budget = min(max(int(cur_target_count - xyz.shape[-1]), 1), xyz.shape[-1])
+        if budget < 1:
+            return
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
         densify_index = torch.multinomial(score, budget, replacement=False)
@@ -436,37 +537,59 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
 
         #split
-        stds=scale[...,split_index].exp()
-        means=torch.zeros((3,stds.size(-1)),device="cuda")
-        samples = torch.normal(mean=means, std=stds).unsqueeze(0)
-        transform_matrix=wrapper.CreateTransformMatrix.call_fused(torch.ones_like(scale[...,split_index]),torch.nn.functional.normalize(rot[...,split_index],dim=0))
-        transform_matrix=transform_matrix[:3,:3]
-        shift=(samples.permute(2,0,1))@transform_matrix.permute(2,0,1)
-        shift=shift.permute(1,2,0).squeeze(0)
+        shift = torch.zeros((3, 0), device=xyz.device)  # default empty
+        if split_index.numel() > 0:
+            stds = scale[..., split_index].exp()
+            means = torch.zeros((3, stds.size(-1)), device="cuda")
+            samples = torch.normal(mean=means, std=stds).unsqueeze(0)
+            transform_matrix = wrapper.CreateTransformMatrix.call_fused(
+                torch.ones_like(scale[..., split_index].exp()),
+                torch.nn.functional.normalize(rot[..., split_index], dim=0)
+            )
+            transform_matrix = transform_matrix[:3, :3]
+            shift = (samples.permute(2, 0, 1) @ transform_matrix.permute(2, 0, 1)).permute(1, 2, 0).squeeze(0)
         
-        split_xyz=xyz[...,split_index]+shift
-        clone_xyz=xyz[...,clone_index]
-        append_xyz=torch.cat((split_xyz,clone_xyz),dim=-1)
-        
-        split_scale = (scale[...,split_index].exp() / (0.8*2)).log()
-        clone_scale = scale[...,clone_index]
-        append_scale = torch.cat((split_scale,clone_scale),dim=-1)
+        parts = []
+        if split_index.numel() > 0:
+            parts.append(xyz[..., split_index] + shift)
+        if clone_index.numel() > 0:
+            parts.append(xyz[..., clone_index])
+        append_xyz = torch.cat(parts, dim=-1)
 
-        split_rot=rot[...,split_index]
-        clone_rot=rot[...,clone_index]
-        append_rot = torch.cat((split_rot,clone_rot),dim=-1)
+        parts = []
+        if split_index.numel() > 0:
+            parts.append((scale[..., split_index].exp() / (0.8 * 2)).log())
+        if clone_index.numel() > 0:
+            parts.append(scale[..., clone_index])
+        append_scale = torch.cat(parts, dim=-1)
 
-        split_sh_0=sh_0[...,split_index]
-        clone_sh_0=sh_0[...,clone_index]
-        append_sh_0 = torch.cat((split_sh_0,clone_sh_0),dim=-1)
+        parts = []
+        if split_index.numel() > 0:
+            parts.append(rot[..., split_index])
+        if clone_index.numel() > 0:
+            parts.append(rot[..., clone_index])
+        append_rot = torch.cat(parts, dim=-1)
 
-        split_sh_rest=sh_rest[...,split_index]
-        clone_sh_rest=sh_rest[...,clone_index]
-        append_sh_rest = torch.cat((split_sh_rest,clone_sh_rest),dim=-1)
+        parts = []
+        if split_index.numel() > 0:
+            parts.append(sh_0[..., split_index])
+        if clone_index.numel() > 0:
+            parts.append(sh_0[..., clone_index])
+        append_sh_0 = torch.cat(parts, dim=-1)
 
-        split_opacity=opacity[...,split_index]
-        clone_opacity=opacity[...,clone_index]
-        append_opacity = torch.cat((split_opacity,clone_opacity),dim=-1)
+        parts = []
+        if split_index.numel() > 0:
+            parts.append(sh_rest[..., split_index])
+        if clone_index.numel() > 0:
+            parts.append(sh_rest[..., clone_index])
+        append_sh_rest = torch.cat(parts, dim=-1)
+
+        parts = []
+        if split_index.numel() > 0:
+            parts.append(opacity[..., split_index])
+        if clone_index.numel() > 0:
+            parts.append(opacity[..., clone_index])
+        append_opacity = torch.cat(parts, dim=-1)
 
         if self.bCluster:
             N=append_xyz.shape[-1]

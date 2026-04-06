@@ -99,13 +99,15 @@ class DensifyParams(ParamGroup):
 
     prune_mode='weight'#'weight','threshold'
     soft_prune_from_epoch = 13 #1 #8
-    hard_prune = False
     soft_prune_epoch_interval = 5
+    hard_prune = True
+    hard_prune_epoch_interval = 12
+    hard_prune_strength = 1.8 # < 1.0 → prune harder than soft prune; > 1.0 → prune softer than soft prune; = 1.0 → same as soft prune
 
     # Goal for densification
-    target_primitives=1000000
+    target_primitives=2000000
     
-    mass_threshold = 0.94
+    # mass_threshold = 0.94
     lambda_s = 0.9 # 90% speedy-splat and 10% opacity
     morton_gap_alpha = 0.5
 
