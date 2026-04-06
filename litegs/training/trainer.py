@@ -275,7 +275,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             }, iteration)
 
             if epoch == 12:
-                density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim)
+                density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim, iteration)
 
             _epoch_train_psnr_sum = 0.0
             _epoch_train_ssim_sum = 0.0
