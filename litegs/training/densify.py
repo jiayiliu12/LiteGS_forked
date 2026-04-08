@@ -492,7 +492,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         gap_weights[indices] = local_gap
         return gap_weights.clamp(0, 3.0)
 
-    def get_score(self, xyz, scale, rot, sh_0, sh_rest, opacity):
+    def get_score_gap_weight(self, xyz, scale, rot, sh_0, sh_rest, opacity):
         print("new morton densification score!!! ###")
         var, frag_count = StatisticsHelperInst.get_var('fragment_err')
         score = var * frag_count * (opacity.sigmoid() ** 2)
@@ -500,6 +500,42 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
         gap_w = self.compute_morton_gap_weight(xyz)
         score = score * (1.0 + self.densify_params.morton_gap_alpha * gap_w)
+        return score
+    
+    @torch.no_grad()
+    def compute_scale_gap_ratio(self, xyz: torch.Tensor, scale: torch.Tensor,
+                                window: int = 8) -> torch.Tensor:
+        codes = _gen_morton_code(xyz)
+        sorted_codes, indices = codes.sort(stable=True)
+
+        xyz_sorted = xyz[:, indices]  # (3, N)
+        N = xyz_sorted.shape[1]
+        pad = window // 2
+
+        # Mean physical distance to Morton neighbors (cheap spatial proxy)
+        xyz_pad = torch.cat([xyz_sorted[:, :pad].flip(-1),
+                            xyz_sorted,
+                            xyz_sorted[:, -pad:].flip(-1)], dim=-1)
+        neighbors = torch.stack([xyz_pad[:, i:i+N] for i in range(window)], dim=-1)
+        dists = ((neighbors - xyz_sorted.unsqueeze(-1)) ** 2).sum(0).sqrt()
+        mean_spacing = dists.mean(-1)  # (N,)
+
+        max_scale_sorted = scale.exp().max(dim=0).values[indices]  # (N,)
+
+        # Ratio > 1 means Gaussian is bigger than its neighborhood spacing
+        ratio = max_scale_sorted / (mean_spacing + 1e-8)
+
+        out = torch.empty_like(ratio)
+        out[indices] = ratio
+        return out.clamp(0, 5.0)
+
+    def get_score_scale_gap_ratio(self, xyz, scale, rot, sh_0, sh_rest, opacity):
+        var, frag_count = StatisticsHelperInst.get_var('fragment_err')
+        score = var * frag_count * (opacity.sigmoid() ** 2)
+        score = score.squeeze().nan_to_num(0).clamp_min_(0)
+
+        sg_ratio = self.compute_scale_gap_ratio(xyz, scale)
+        score = score * (1.0 + self.densify_params.morton_scale_alpha * sg_ratio)
         return score
     
     def get_score_old(self,xyz,scale,rot,sh_0,sh_rest,opacity)->torch.Tensor:
@@ -510,6 +546,44 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         score.clamp_min_(0)
         return score
     
+    @torch.no_grad()
+    def morton_chunked_sample(self, score: torch.Tensor, xyz: torch.Tensor,
+                            budget: int, n_chunks: int = 16,
+                            max_chunk_fraction: float = 0.3) -> torch.Tensor:
+        codes = _gen_morton_code(xyz)
+        _, indices = codes.sort(stable=True)
+        N = score.shape[0]
+        chunk_size = N // n_chunks
+        max_per_chunk = max(1, int(budget * max_chunk_fraction))
+
+        # Score mass per chunk → proportional budget
+        chunk_masses = []
+        chunk_index_lists = []
+        for c in range(n_chunks):
+            lo = c * chunk_size
+            hi = lo + chunk_size if c < n_chunks - 1 else N
+            chunk_idx = indices[lo:hi]
+            chunk_index_lists.append(chunk_idx)
+            chunk_masses.append(score[chunk_idx].sum().item())
+
+        total_mass = sum(chunk_masses) + 1e-8
+        selected = []
+        for c in range(n_chunks):
+            chunk_idx = chunk_index_lists[c]
+            chunk_scores = score[chunk_idx]
+            # Proportional share, capped
+            prop_budget = int(budget * chunk_masses[c] / total_mass)
+            k = min(prop_budget, max_per_chunk, chunk_idx.shape[0],
+                    (chunk_scores > 0).sum().item())
+            if k == 0:
+                continue
+            local = torch.multinomial(chunk_scores.clamp_min(1e-8), k, replacement=False)
+            selected.append(chunk_idx[local])
+
+        if not selected:
+            return torch.multinomial(score.clamp_min(1e-8), budget, replacement=False)
+        return torch.cat(selected)
+
     @torch.no_grad()
     def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
         
@@ -531,8 +605,11 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         if budget < 1:
             return
 
-        score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
+        # score=self.get_score_gap_weight(xyz,scale,rot,sh_0,sh_rest,opacity)
+        score=self.get_score_scale_gap_ratio(xyz, scale, rot, sh_0, sh_rest, opacity)
+        # score=self.get_score_old(xyz,scale,rot,sh_0,sh_rest,opacity)
         densify_index = torch.multinomial(score, budget, replacement=False)
+        # densify_index = self.morton_chunked_sample(score, xyz, budget, 16)
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
 
