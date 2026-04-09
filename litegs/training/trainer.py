@@ -11,7 +11,7 @@ import time
 import matplotlib.pyplot as plt
 import json
 import wandb
-# from .lpipsPyTorch import lpips
+from .lpipsPyTorch import lpips
 
 from .. import arguments
 from .. import data
@@ -242,11 +242,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
                         "time/total_iteration [ms]": total_iteration_time,
                         "time/sum_time [ms]": sum_time,
-                        "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
-                        "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
-                        "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
-                        "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
-                        "time/render/Binning [ms]": elapsed_times["Binning_time"],
                     }, iteration)
                 
                 if prune_bool:
@@ -268,11 +263,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         if _epoch_train_n > 0:
             _epoch_avg_psnr = _epoch_train_psnr_sum / _epoch_train_n
             _epoch_avg_ssim = _epoch_train_ssim_sum / _epoch_train_n
-
-            wandb.log({
-                "train/psnr": _epoch_avg_psnr,
-                "train/ssim": _epoch_avg_ssim,
-            }, iteration)
 
             if epoch == 12:
                 density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim, iteration)
@@ -296,6 +286,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_list=[]
                     psnr_list=[]
                     ssim_list=[]
+                    lpips_list=[]
                     logged_images = []
                     num_log_images = 6
                     log_indices = set(np.linspace(0, len(loader) - 1, num_log_images, dtype=int).tolist())
@@ -321,6 +312,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
+                        lpips_list.append(lpips(img,gt_image).unsqueeze(0))
 
                         if VERBOSE: 
                             if name == "Testset" and batch_i in log_indices:
@@ -338,6 +330,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
+                    lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
                     MAX_GAUSSIANS = 1_000_000
                     MAX_PSNR = 30.0
@@ -357,6 +350,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"sweep/objective_{name}" : _sweep_objective,
                         f"sweep/psnr_score_{name}"    : _psnr_score,
                         f"sweep/density_score_{name}" : _density_score,
+                        f"test/lpips_{name}" : lpips_mean.item(),
                     }, iteration)
                     if VERBOSE:
                         if name=="Testset":
@@ -364,7 +358,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 f"test/renders_{name}" : logged_images,
                             }, iteration)
                             
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
+                    tqdm.write("\n[EPOCH {}] {} Evaluating: LPIPS {} with xyz.shape {}".format(epoch,name,lpips_mean, str(xyz.shape)))
 
         _densify_t0 = time.perf_counter()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
