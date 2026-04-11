@@ -10,6 +10,7 @@ import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
 import json
 import wandb
+from .lpipsPyTorch import lpips
 
 
 from .. import arguments
@@ -221,6 +222,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_list=[]
                     psnr_list=[]
                     ssim_list=[]
+                    if epoch==total_epoch-1:
+                        lpips_list=[]
                     logged_images = []
                     num_log_images = 6
                     # Pick 6 evenly-spaced frame indices across the loader
@@ -249,6 +252,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
+                        if epoch==total_epoch-1:
+                            lpips_list.append(lpips(img,gt_image).unsqueeze(0))
 
                         # --- Wandb image logging ---
                         # img and gt_image are [1, 3, H, W] tensors in [0, 1].
@@ -268,17 +273,25 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
+                    if epoch==total_epoch-1:
+                        lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
                     wandb.log({
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
                     }, iteration)
+
                     if name=="Testset":
                         wandb.log({
                             f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
                         }, iteration)
-                        
+
+                    if epoch==total_epoch-1:
+                        wandb.log({
+                            f"test/lpips_{name}" : lpips_mean.item(),
+                        }, iteration)
+
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         densification_pruning_start.record()

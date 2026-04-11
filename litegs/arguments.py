@@ -99,7 +99,7 @@ class DensifyParams(ParamGroup):
     opacity_reset_interval = 10
     opacity_reset_mode='decay'#'decay','reset'
     prune_mode='weight'#'weight','threshold'
-    target_primitives=1000000
+    target_primitives=3000000
     
 
 
