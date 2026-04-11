@@ -312,7 +312,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         l1_loss_test_list.append(__l1_loss(img,gt_image).unsqueeze(0))
                         psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
                         ssim_list.append(fused_ssim.fused_ssim(img,gt_image).unsqueeze(0))
-                        lpips_list.append(lpips(img,gt_image).unsqueeze(0))
+                        if epoch==total_epoch-1:
+                            lpips_list.append(lpips(img,gt_image).unsqueeze(0))
 
                         if VERBOSE: 
                             if name == "Testset" and batch_i in log_indices:
@@ -330,28 +331,47 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     l1_loss_test_mean=torch.concat(l1_loss_test_list,dim=0).mean()
                     psnr_mean=torch.concat(psnr_list,dim=0).mean()
                     ssim_mean=torch.concat(ssim_list,dim=0).mean()
-                    lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
-                    MAX_GAUSSIANS = 1_000_000
-                    MAX_PSNR = 30.0
+                    # MAX_GAUSSIANS = 1_000_000
+                    # MAX_PSNR = 30.0
 
-                    _gaussian_count = xyz.shape[1] * xyz.shape[2]
+                    # _gaussian_count = xyz.shape[1] * xyz.shape[2]
 
-                    _psnr_score    = psnr_mean.item() / MAX_PSNR
-                    _density_score = 1.0 - (_gaussian_count / MAX_GAUSSIANS)
+                    # _psnr_score    = psnr_mean.item() / MAX_PSNR
+                    # _density_score = 1.0 - (_gaussian_count / MAX_GAUSSIANS)
 
-                    _alpha = 0.7
-                    _sweep_objective = _alpha * _psnr_score + (1.0 - _alpha) * _density_score
+                    # _alpha = 0.7
+                    # _sweep_objective = _alpha * _psnr_score + (1.0 - _alpha) * _density_score
+
+                    # wandb.log({
+                    #     f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
+                    #     f"test/psnr_{name}" : psnr_mean.item(),
+                    #     f"test/ssim_{name}" : ssim_mean.item(),
+                    #     f"sweep/objective_{name}" : _sweep_objective,
+                    #     f"sweep/psnr_score_{name}"    : _psnr_score,
+                    #     f"sweep/density_score_{name}" : _density_score,
+                    #     f"test/lpips_{name}" : lpips_mean.item(),
+                    # }, iteration)
+
+                    if epoch==total_epoch-1:
+                        lpips_mean=torch.concat(lpips_list,dim=0).mean()
 
                     wandb.log({
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                        f"sweep/objective_{name}" : _sweep_objective,
-                        f"sweep/psnr_score_{name}"    : _psnr_score,
-                        f"sweep/density_score_{name}" : _density_score,
-                        f"test/lpips_{name}" : lpips_mean.item(),
                     }, iteration)
+
+                    if name=="Testset":
+                        wandb.log({
+                            f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
+                        }, iteration)
+
+                    if epoch==total_epoch-1:
+                        wandb.log({
+                            f"test/lpips_{name}" : lpips_mean.item(),
+                        }, iteration)
+
                     if VERBOSE:
                         if name=="Testset":
                             wandb.log({
