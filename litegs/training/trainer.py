@@ -378,7 +378,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                                 f"test/renders_{name}" : logged_images,
                             }, iteration)
                             
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: LPIPS {} with xyz.shape {}".format(epoch,name,lpips_mean, str(xyz.shape)))
+                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         _densify_t0 = time.perf_counter()
         xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
