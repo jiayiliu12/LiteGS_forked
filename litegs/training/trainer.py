@@ -122,15 +122,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     _all_iter_ms: list[float] = []
     _all_densify_ms: list[float] = []
 
-    # ── Adaptive pruning: per-epoch training metric accumulators ──────────────
-    # We reuse img and gt_image that are already computed in the training loop —
-    # no extra forward passes. ssim is free (already in ssim_loss); PSNR is one
-    # cheap metric kernel on already-rendered tensors.
+    # Metrics for calibrate_ADP_from_quality — accumulated in every pruning epoch so
+    # that keep_ratio reflects current quality before each prune decision.
     _train_psnr_metric = psnr.PeakSignalNoiseRatio(data_range=(0.0, 1.0)).cuda()
     _epoch_train_psnr_sum = 0.0
     _epoch_train_ssim_sum = 0.0
     _epoch_train_n        = 0
-    # ─────────────────────────────────────────────────────────────────────────
 
     for epoch in range(start_epoch,total_epoch):
 
@@ -213,14 +210,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     view_opt.zero_grad()
                 schedular.step()
 
-                # ── Accumulate per-iteration train metrics for adaptive pruning ──
-                # ssim_loss = 1 - SSIM, so SSIM = 1 - ssim_loss.item(). Free.
-                # PSNR: one cheap metric kernel on already-rendered img. No re-render.
-                with torch.no_grad():
-                    _epoch_train_ssim_sum += 1.0 - ssim_loss.item()
-                    _epoch_train_psnr_sum += _train_psnr_metric(img.detach(), gt_image).item()
-                    _epoch_train_n        += 1
-                # ─────────────────────────────────────────────────────────────────
+                # Accumulate metrics in every pruning epoch so calibration is fresh.
+                if prune_bool:
+                    with torch.no_grad():
+                        _epoch_train_ssim_sum += 1.0 - ssim_loss.item()
+                        _epoch_train_psnr_sum += _train_psnr_metric(img.detach(), gt_image).item()
+                        _epoch_train_n        += 1
 
                 torch.cuda.synchronize()
                 _iter_ms = (time.perf_counter() - _iter_t0) * 1000
@@ -254,23 +249,15 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 
                 iteration+=1
 
-        # ── End of epoch: compute averages, calibrate pruning, reset accumulators ──
-        # Calibration happens once after epoch 0 — the first time every training
-        # view has been seen. At that point PSNR and SSIM already clearly separate
-        # simple from complex scenes (visible in your WandB plots at step 2k).
-        # Pruning only starts at soft_prune_from_epoch which is always > 0, so
-        # calibrate_ADP_from_quality is guaranteed to fire before any pruning.
-        if _epoch_train_n > 0:
-            _epoch_avg_psnr = _epoch_train_psnr_sum / _epoch_train_n
-            _epoch_avg_ssim = _epoch_train_ssim_sum / _epoch_train_n
-
-            if epoch == dp.soft_prune_from_epoch - 1:
-                density_controller.calibrate_ADP_from_quality(_epoch_avg_psnr, _epoch_avg_ssim, iteration)
-
+        if prune_bool and _epoch_train_n > 0:
+            density_controller.calibrate_ADP_from_quality(
+                _epoch_train_psnr_sum / _epoch_train_n,
+                _epoch_train_ssim_sum / _epoch_train_n,
+                iteration,
+            )
             _epoch_train_psnr_sum = 0.0
             _epoch_train_ssim_sum = 0.0
             _epoch_train_n        = 0
-        # ──────────────────────────────────────────────────────────────────────────
 
         if epoch in test_epochs or epoch==total_epoch-1:
             with torch.no_grad():

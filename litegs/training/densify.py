@@ -149,20 +149,12 @@ class DensityControllerOfficial(DensityControllerBase):
         iteration: int
     ) -> None:
         """
-        Called exactly once, after the first full epoch.
-        
-        SSIM after 1 epoch is the ideal complexity proxy:
-        - Already in [0, 1], no normalisation needed
-        - High SSIM (0.78 in your simple scene) → scene is easy → prune hard
-        - Low  SSIM (0.35 in your complex scenes) → scene needs Gaussians → keep more
-        
-        keep_ratio = 1 - ssim_epoch1 is the entire formula.
-        Simple: 1 - 0.78 = 0.22 → keep 22%, prune 78%
-        Complex A: 1 - 0.52 = 0.48 → keep 48%
-        Complex B: 1 - 0.35 = 0.65 → keep 65%
-        
-        PSNR is used as a secondary consistency check — averaged with SSIM signal
-        to be more robust to outlier frames.
+        Called ~5 times throughout training (evenly spaced from just before pruning
+        starts to the final epoch). Each call overwrites keep_ratio with the current
+        PSNR/SSIM so that pruning and densification tighten automatically as quality
+        improves: high SSIM → small keep_ratio → prune more aggressively.
+
+        PSNR is blended in as a secondary signal for robustness to outlier frames.
         """
         # SSIM signal: already in [0,1]
         ssim_keep = 1.0 - float(train_ssim)
@@ -175,8 +167,14 @@ class DensityControllerOfficial(DensityControllerBase):
         raw = 0.5 * ssim_keep + 0.5 * psnr_keep
 
 
+        # 4. Aggressive — keeps 15–85% (close to original behaviour) -> -1)
+        # self._calibrated_keep_ratio = float(max(0.15, min(0.85, 0.15 + 0.70 * raw)))
+
+        # 5. Very aggressive — original formula (current behaviour) -> 0)
+        # self._calibrated_keep_ratio = float(max(0.10, min(0.95, 0.10 + 0.85 * raw)))
+
         # # 3. Balanced (your current starting point) — keeps 25–75% -> 1)
-        self._calibrated_keep_ratio = float(max (0.25, min(0.75, 0.25 + 0.50 * raw)))
+        # self._calibrated_keep_ratio = float(max (0.25, min(0.75, 0.25 + 0.50 * raw)))
         # # garden → 0.39
 
         # # 2a. keeps 30–75% -> 2)
@@ -188,7 +186,7 @@ class DensityControllerOfficial(DensityControllerBase):
         # # garden → 0.46
 
         # # 1b. keeps 40–75% -> 4)
-        # self._calibrated_keep_ratio = float(max(0.40, min(0.75, 0.40 + 0.35 * raw)))
+        self._calibrated_keep_ratio = float(max(0.40, min(0.75, 0.40 + 0.35 * raw)))
         # # garden → 0.50
 
         # # 1c. keeps 45–75% -> 5)
@@ -236,19 +234,19 @@ class DensityControllerOfficial(DensityControllerBase):
             lambda_s       * _robust_minmax(scores)
             + (1 - lambda_s) * _robust_minmax(opacity.squeeze())
         )
-        sorted_scores, sorted_idx = torch.sort(weighted, descending=True)
 
         keep_count = max(1, int(keep_ratio * scores.shape[0]))
+        top_vals, top_idx = torch.topk(weighted, keep_count, largest=True, sorted=False)
 
         prune_mask = torch.ones(scores.shape[0], device=scores.device, dtype=torch.bool)
-        prune_mask[sorted_idx[:keep_count]] = False
+        prune_mask[top_idx] = False
 
         wandb.log({
             "score_mass/keep_ratio_target": keep_ratio,
             "score_mass/keep_ratio_actual": keep_count / scores.shape[0],
             "score_mass/keep_count":        keep_count,
             "score_mass/total_count":       scores.shape[0],
-            "score_mass/threshold":         sorted_scores[keep_count - 1].item(),
+            # "score_mass/threshold":         top_vals.min().item(),
         }, iteration)
 
         return prune_mask
@@ -266,9 +264,10 @@ class DensityControllerOfficial(DensityControllerBase):
                 "calibrate_ADP_from_quality() must be called before pruning."
             )
 
-        # Hard prune uses strength multiplier; soft prune uses calibrated ratio as-is.
-        # Clamp so we never go below 0.10 (always keep at least 10% of Gaussians)
-        # or above 0.95 (always prune at least 5%).
+        # Hard prune: floor at 0.80 so each step removes at most 20% of Gaussians.
+        # _calibrated_keep_ratio floors at 0.25 for high-quality scenes, so without
+        # the 0.80 floor, strength=2.0 still only keeps 50% — too aggressive when
+        # compounding over multiple hard prune steps.
         if is_hard_prune:
             keep_ratio = float(max(0.10, min(0.95,
                 self._calibrated_keep_ratio * self.densify_params.hard_prune_strength
