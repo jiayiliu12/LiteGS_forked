@@ -105,7 +105,7 @@ class DensifyParams(ParamGroup):
     hard_prune_strength = 1.8 # < 1.0 → prune harder than soft prune; > 1.0 → prune softer than soft prune; = 1.0 → same as soft prune
 
     # Goal for densification
-    target_primitives=2000000
+    target_primitives=3000000
     
     # mass_threshold = 0.94
     lambda_s = 0.9 # 90% speedy-splat and 10% opacity

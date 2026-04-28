@@ -259,13 +259,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         # view has been seen. At that point PSNR and SSIM already clearly separate
         # simple from complex scenes (visible in your WandB plots at step 2k).
         # Pruning only starts at soft_prune_from_epoch which is always > 0, so
-        # calibrate_from_first_epoch is guaranteed to fire before any pruning.
+        # calibrate_ADP_from_quality is guaranteed to fire before any pruning.
         if _epoch_train_n > 0:
             _epoch_avg_psnr = _epoch_train_psnr_sum / _epoch_train_n
             _epoch_avg_ssim = _epoch_train_ssim_sum / _epoch_train_n
 
-            if epoch == 12:
-                density_controller.calibrate_from_first_epoch(_epoch_avg_psnr, _epoch_avg_ssim, iteration)
+            if epoch == dp.soft_prune_from_epoch - 1:
+                density_controller.calibrate_ADP_from_quality(_epoch_avg_psnr, _epoch_avg_ssim, iteration)
 
             _epoch_train_psnr_sum = 0.0
             _epoch_train_ssim_sum = 0.0

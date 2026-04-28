@@ -142,7 +142,7 @@ class DensityControllerOfficial(DensityControllerBase):
         return selected_pts_mask
 
     @torch.no_grad()
-    def calibrate_from_first_epoch(
+    def calibrate_ADP_from_quality(
         self,
         train_psnr: float,
         train_ssim: float,
@@ -172,9 +172,34 @@ class DensityControllerOfficial(DensityControllerBase):
         psnr_norm = (max(15.0, min(35.0, float(train_psnr))) - 15.0) / 20.0
         psnr_keep = 1.0 - psnr_norm   # high PSNR → simple → prune more → low keep
 
-        self._calibrated_keep_ratio = float(
-            max(0.10, min(0.95, 0.5 * ssim_keep + 0.5 * psnr_keep))
-        )
+        raw = 0.5 * ssim_keep + 0.5 * psnr_keep
+
+
+        # # 3. Balanced (your current starting point) — keeps 25–75% -> 1)
+        self._calibrated_keep_ratio = float(max (0.25, min(0.75, 0.25 + 0.50 * raw)))
+        # # garden → 0.39
+
+        # # 2a. keeps 30–75% -> 2)
+        # self._calibrated_keep_ratio = float(max(0.30, min(0.75, 0.30 + 0.45 * raw)))
+        # # garden → 0.42
+
+        # # 1a. keeps 35–75% -> 3)
+        # self._calibrated_keep_ratio = float(max(0.35, min(0.75, 0.35 + 0.40 * raw)))
+        # # garden → 0.46
+
+        # # 1b. keeps 40–75% -> 4)
+        # self._calibrated_keep_ratio = float(max(0.40, min(0.75, 0.40 + 0.35 * raw)))
+        # # garden → 0.50
+
+        # # 1c. keeps 45–75% -> 5)
+        # self._calibrated_keep_ratio = float(max(0.45, min(0.75, 0.45 + 0.30 * raw)))
+        # # garden → 0.53
+
+        # # 1d. keeps 50–75% (very conservative) -> 6)
+        # self._calibrated_keep_ratio = float(max(0.50, min(0.75, 0.50 + 0.25 * raw)))
+        # # garden → 0.57
+
+
         self._calibrated = True
 
         wandb.log({
@@ -196,9 +221,15 @@ class DensityControllerOfficial(DensityControllerBase):
         """
         lambda_s = self.densify_params.lambda_s
 
-        def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99):
-            lo_v = torch.quantile(t, lo)
-            hi_v = torch.quantile(t, hi)
+        # def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99):
+        #     lo_v = torch.quantile(t, lo)
+        #     hi_v = torch.quantile(t, hi)
+        #     return (t.clamp(lo_v, hi_v) - lo_v) / (hi_v - lo_v + 1e-8)
+
+        def _robust_minmax(t: torch.Tensor, lo: float = 0.01, hi: float = 0.99) -> torch.Tensor:
+            # Single kernel call for both quantiles.
+            q = torch.quantile(t, torch.tensor([lo, hi], device=t.device, dtype=t.dtype))
+            lo_v, hi_v = q[0], q[1]
             return (t.clamp(lo_v, hi_v) - lo_v) / (hi_v - lo_v + 1e-8)
 
         weighted = (
@@ -232,7 +263,7 @@ class DensityControllerOfficial(DensityControllerBase):
     ) -> None:
         if not getattr(self, "_calibrated", False):
             raise RuntimeError(
-                "calibrate_from_first_epoch() must be called before pruning."
+                "calibrate_ADP_from_quality() must be called before pruning."
             )
 
         # Hard prune uses strength multiplier; soft prune uses calibrated ratio as-is.
@@ -444,9 +475,9 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         return
     
     @torch.no_grad()
-    def calibrate_from_first_epoch(self, train_psnr: float, train_ssim: float, iteration: int) -> None:
+    def calibrate_ADP_from_quality(self, train_psnr: float, train_ssim: float, iteration: int) -> None:
         # Sets self._calibrated_keep_ratio and self._calibrated on this object
-        super().calibrate_from_first_epoch(train_psnr, train_ssim, iteration)
+        super().calibrate_ADP_from_quality(train_psnr, train_ssim, iteration)
 
         # Adaptive densification target — needs self.target_points_num from this class
         _MIN_TARGET = 600_000
