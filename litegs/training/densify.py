@@ -186,11 +186,11 @@ class DensityControllerOfficial(DensityControllerBase):
         # # garden → 0.46
 
         # # 1b. keeps 40–75% -> 4)
-        self._calibrated_keep_ratio = float(max(0.40, min(0.75, 0.40 + 0.35 * raw)))
+        # self._calibrated_keep_ratio = float(max(0.40, min(0.75, 0.40 + 0.35 * raw)))
         # # garden → 0.50
 
         # # 1c. keeps 45–75% -> 5)
-        # self._calibrated_keep_ratio = float(max(0.45, min(0.75, 0.45 + 0.30 * raw)))
+        self._calibrated_keep_ratio = float(max(0.45, min(0.75, 0.45 + 0.30 * raw)))
         # # garden → 0.53
 
         # # 1d. keeps 50–75% (very conservative) -> 6)

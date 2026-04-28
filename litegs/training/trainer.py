@@ -122,8 +122,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     _all_iter_ms: list[float] = []
     _all_densify_ms: list[float] = []
 
-    # Metrics for calibrate_ADP_from_quality — accumulated in every pruning epoch so
-    # that keep_ratio reflects current quality before each prune decision.
+    # Calibration schedule for calibrate_ADP_from_quality:
+    #   1) start of soft pruning window
+    #   2) 1/3 through the soft pruning window
+    #   3) 1 epoch before hard pruning starts
+    #   4) every hard pruning epoch (handled dynamically via hard_prune_bool)
+    _soft_prune_window = max(1, dp.densify_until - dp.soft_prune_from_epoch)
+    _fixed_calibration_epochs = {
+        dp.soft_prune_from_epoch,
+        dp.soft_prune_from_epoch + _soft_prune_window // 3,
+        max(0, dp.densify_until - 1),
+    }
     _train_psnr_metric = psnr.PeakSignalNoiseRatio(data_range=(0.0, 1.0)).cuda()
     _epoch_train_psnr_sum = 0.0
     _epoch_train_ssim_sum = 0.0
@@ -142,18 +151,30 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             total_iteration_time=0
             densification_pruning_time=0
 
-            prune_bool = (
-                (epoch >= dp.densify_from and epoch < dp.densify_until and
-                epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0) or
-                (dp.hard_prune and epoch >= dp.densify_until and
-                (epoch - dp.densify_until) % dp.hard_prune_epoch_interval == 0)
+            soft_prune_bool = (
+                epoch >= dp.densify_from and epoch < dp.densify_until and
+                epoch >= dp.soft_prune_from_epoch and epoch % dp.soft_prune_epoch_interval == 0
             )
+            hard_prune_bool = (
+                dp.hard_prune and epoch >= dp.densify_until and
+                (epoch - dp.densify_until) % dp.hard_prune_epoch_interval == 0
+            )
+            prune_bool = soft_prune_bool or hard_prune_bool
+            _should_calibrate = (epoch in _fixed_calibration_epochs) or hard_prune_bool
 
             scores = torch.zeros(opacity.numel(), device=opacity.device, dtype=opacity.dtype) if prune_bool else None
             if prune_bool:
                 print(f"Start soft/hard pruning at epoch {epoch} ####")
 
         _epoch_score_accum_ms = 0.0
+        _epoch_loss_sum = 0.0
+        _epoch_l1_sum = 0.0
+        _epoch_backward_ms_sum = 0.0
+        _epoch_render_ms_sum = 0.0
+        _epoch_rasterize_ms_sum = 0.0
+        _epoch_preprocess_ms_sum = 0.0
+        _epoch_iter_ms_sum = 0.0
+        _epoch_n_iters = 0
         torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
@@ -210,8 +231,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     view_opt.zero_grad()
                 schedular.step()
 
-                # Accumulate metrics in every pruning epoch so calibration is fresh.
-                if prune_bool:
+                if _should_calibrate:
                     with torch.no_grad():
                         _epoch_train_ssim_sum += 1.0 - ssim_loss.item()
                         _epoch_train_psnr_sum += _train_psnr_metric(img.detach(), gt_image).item()
@@ -221,23 +241,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 _iter_ms = (time.perf_counter() - _iter_t0) * 1000
                 _all_iter_ms.append(_iter_ms)
                 total_iteration_time = _iter_ms
-                wandb.log({
-                        "train/total_loss": loss.item(),
-                        "gaussians/count": xyz.shape[1] * xyz.shape[2],
-                        "time/backward [ms]": backward_start.elapsed_time(backward_end),
-                        "time/render [ms]": elapsed_times["render_time"],
-                        "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
-                    }, iteration)
 
+                _epoch_loss_sum += loss.item()
+                _epoch_backward_ms_sum += backward_start.elapsed_time(backward_end)
+                _epoch_render_ms_sum += elapsed_times["render_time"]
+                _epoch_rasterize_ms_sum += elapsed_times["GaussiansRasterFunc_time"]
+                _epoch_iter_ms_sum += _iter_ms
+                _epoch_n_iters += 1
                 if VERBOSE:
-                    sum_time+=total_iteration_time
-
-                    wandb.log({
-                        "train/L1": l1_loss.item(),
-                        "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
-                        "time/total_iteration [ms]": total_iteration_time,
-                        "time/sum_time [ms]": sum_time,
-                    }, iteration)
+                    sum_time += total_iteration_time
+                    _epoch_l1_sum += l1_loss.item()
+                    _epoch_preprocess_ms_sum += preprocess_start.elapsed_time(preprocess_end)
                 
                 if prune_bool:
                     torch.cuda.synchronize()
@@ -249,11 +263,26 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 
                 iteration+=1
 
-        if prune_bool and _epoch_train_n > 0:
+        wandb.log({
+            "train/total_loss": _epoch_loss_sum / _epoch_n_iters,
+            "gaussians/count": xyz.shape[1] * xyz.shape[2],
+            "time/backward [ms]": _epoch_backward_ms_sum / _epoch_n_iters,
+            "time/render [ms]": _epoch_render_ms_sum / _epoch_n_iters,
+            "time/render/rasterize_forward [ms]": _epoch_rasterize_ms_sum / _epoch_n_iters,
+        }, epoch)
+        if VERBOSE:
+            wandb.log({
+                "train/L1": _epoch_l1_sum / _epoch_n_iters,
+                "time/render_preprocess(cluster culling) [ms]": _epoch_preprocess_ms_sum / _epoch_n_iters,
+                "time/total_iteration [ms]": _epoch_iter_ms_sum / _epoch_n_iters,
+                "time/sum_time [ms]": sum_time,
+            }, epoch)
+
+        if _should_calibrate and _epoch_train_n > 0:
             density_controller.calibrate_ADP_from_quality(
                 _epoch_train_psnr_sum / _epoch_train_n,
                 _epoch_train_ssim_sum / _epoch_train_n,
-                iteration,
+                epoch,
             )
             _epoch_train_psnr_sum = 0.0
             _epoch_train_ssim_sum = 0.0
@@ -347,28 +376,28 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                    }, iteration)
+                    }, epoch)
 
                     if name=="Testset":
                         wandb.log({
                             f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
-                        }, iteration)
+                        }, epoch)
 
                     if epoch==total_epoch-1:
                         wandb.log({
                             f"test/lpips_{name}" : lpips_mean.item(),
-                        }, iteration)
+                        }, epoch)
 
                     if VERBOSE:
                         if name=="Testset":
                             wandb.log({
                                 f"test/renders_{name}" : logged_images,
-                            }, iteration)
+                            }, epoch)
                             
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
         _densify_t0 = time.perf_counter()
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,iteration,scores,len(trainingset))
+        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch,epoch,scores,len(trainingset))
         if (dp.hard_prune and epoch >= dp.densify_until and (epoch - dp.densify_until) % dp.hard_prune_epoch_interval == 0 and pp.cluster_size > 0):
             with torch.no_grad():
                 cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
@@ -382,7 +411,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 "time/densification_pruning [ms]": densification_pruning_time,
                 "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
                 "time/sum_time_with_prune [ms]": sum_time_with_prune,
-            }, iteration)
+            }, epoch)
 
         progress_bar.update()
 
