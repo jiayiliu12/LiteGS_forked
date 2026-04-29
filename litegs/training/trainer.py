@@ -31,7 +31,7 @@ def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
 def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.PipelineParams,dp:arguments.DensifyParams,
           test_epochs=[],save_ply=[],save_checkpoint=[],start_checkpoint:str=None):
     
-    wandb.init(project="LiteGS", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
+    wandb.init(project="LiteGS-merged-Speedy-new", config={**vars(lp),**vars(op),**vars(pp),**vars(dp)})
 
     densification_pruning_start = torch.cuda.Event(enable_timing=True)
     densification_pruning_end = torch.cuda.Event(enable_timing=True)
@@ -137,6 +137,19 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             total_iteration_time=0
             densification_pruning_time=0
 
+        _epoch_loss_sum = 0.0
+        _epoch_l1_sum = 0.0
+        _epoch_preprocess_ms_sum = 0.0
+        _epoch_backward_ms_sum = 0.0
+        _epoch_iter_ms_sum = 0.0
+        _epoch_render_ms_sum = 0.0
+        _epoch_transform_ms_sum = 0.0
+        _epoch_rayspace_ms_sum = 0.0
+        _epoch_cov2d_ms_sum = 0.0
+        _epoch_eigh_ms_sum = 0.0
+        _epoch_binning_ms_sum = 0.0
+        _epoch_rasterize_ms_sum = 0.0
+        _epoch_n_iters = 0
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
 
@@ -192,25 +205,39 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 _iter_ms = (time.perf_counter() - _iter_t0) * 1000
                 _all_iter_ms.append(_iter_ms)
                 total_iteration_time = _iter_ms
-                sum_time+=total_iteration_time
+                sum_time += total_iteration_time
 
-                wandb.log({
-                    "train/total_loss": loss.item(),
-                    "train/L1": l1_loss.item(),
-                    "gaussians/count": xyz.shape[1] * xyz.shape[2],
-                    "time/render_preprocess(cluster culling) [ms]": preprocess_start.elapsed_time(preprocess_end),
-                    "time/backward [ms]": backward_start.elapsed_time(backward_end),
-                    "time/total_iteration [ms]": total_iteration_time,
-                    "time/sum_time [ms]": sum_time,
-                    "time/render [ms]": elapsed_times["render_time"],
-                    "time/render/CreateTransformMatrix [ms]": elapsed_times["CreateTransformMatrix_time"],
-                    "time/render/CreateRaySpaceTransformMatrix [ms]": elapsed_times["CreateRaySpaceTransformMatrix_time"],
-                    "time/render/CreateCov2dDirectly [ms]": elapsed_times["CreateCov2dDirectly_time"],
-                    "time/render/EighAndInverse2x2Matrix [ms]": elapsed_times["EighAndInverse2x2Matrix_time"],
-                    "time/render/Binning [ms]": elapsed_times["Binning_time"],
-                    "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
-                }, iteration)
+                _epoch_loss_sum += loss.item()
+                _epoch_l1_sum += l1_loss.item()
+                _epoch_preprocess_ms_sum += preprocess_start.elapsed_time(preprocess_end)
+                _epoch_backward_ms_sum += backward_start.elapsed_time(backward_end)
+                _epoch_iter_ms_sum += _iter_ms
+                _epoch_render_ms_sum += elapsed_times["render_time"]
+                _epoch_transform_ms_sum += elapsed_times["CreateTransformMatrix_time"]
+                _epoch_rayspace_ms_sum += elapsed_times["CreateRaySpaceTransformMatrix_time"]
+                _epoch_cov2d_ms_sum += elapsed_times["CreateCov2dDirectly_time"]
+                _epoch_eigh_ms_sum += elapsed_times["EighAndInverse2x2Matrix_time"]
+                _epoch_binning_ms_sum += elapsed_times["Binning_time"]
+                _epoch_rasterize_ms_sum += elapsed_times["GaussiansRasterFunc_time"]
+                _epoch_n_iters += 1
                 iteration += 1
+
+        wandb.log({
+            "train/total_loss": _epoch_loss_sum / _epoch_n_iters,
+            "train/L1": _epoch_l1_sum / _epoch_n_iters,
+            "gaussians/count": xyz.shape[1] * xyz.shape[2],
+            "time/render_preprocess(cluster culling) [ms]": _epoch_preprocess_ms_sum / _epoch_n_iters,
+            "time/backward [ms]": _epoch_backward_ms_sum / _epoch_n_iters,
+            "time/total_iteration [ms]": _epoch_iter_ms_sum / _epoch_n_iters,
+            "time/sum_time [ms]": sum_time,
+            "time/render [ms]": _epoch_render_ms_sum / _epoch_n_iters,
+            "time/render/CreateTransformMatrix [ms]": _epoch_transform_ms_sum / _epoch_n_iters,
+            "time/render/CreateRaySpaceTransformMatrix [ms]": _epoch_rayspace_ms_sum / _epoch_n_iters,
+            "time/render/CreateCov2dDirectly [ms]": _epoch_cov2d_ms_sum / _epoch_n_iters,
+            "time/render/EighAndInverse2x2Matrix [ms]": _epoch_eigh_ms_sum / _epoch_n_iters,
+            "time/render/Binning [ms]": _epoch_binning_ms_sum / _epoch_n_iters,
+            "time/render/rasterize_forward [ms]": _epoch_rasterize_ms_sum / _epoch_n_iters,
+        }, epoch)
 
 
         if epoch in test_epochs or epoch==total_epoch-1:
@@ -286,17 +313,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                    }, iteration)
+                    }, epoch)
 
                     if name=="Testset":
                         wandb.log({
                             f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
-                        }, iteration)
+                        }, epoch)
 
                     if epoch==total_epoch-1:
                         wandb.log({
                             f"test/lpips_{name}" : lpips_mean.item(),
-                        }, iteration)
+                        }, epoch)
 
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
@@ -312,7 +339,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             "time/densification_pruning [ms]": densification_pruning_time,
             "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
             "time/sum_time_with_prune [ms]": sum_time_with_prune,
-        }, iteration)
+        }, epoch)
 
         progress_bar.update()  
 
