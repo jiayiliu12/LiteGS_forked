@@ -121,6 +121,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     _WARMUP_ITERS = min(100, max(10, op.iterations // 300))
     _all_iter_ms: list[float] = []
     _all_densify_ms: list[float] = []
+    _all_rend_ms: list[float] = []
 
     # Calibration schedule for calibrate_ADP_from_quality:
     #   1) start of soft pruning window
@@ -167,14 +168,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 print(f"Start soft/hard pruning at epoch {epoch} ####")
 
         _epoch_score_accum_ms = 0.0
-        _epoch_loss_sum = 0.0
-        _epoch_l1_sum = 0.0
-        _epoch_backward_ms_sum = 0.0
-        _epoch_render_ms_sum = 0.0
-        _epoch_rasterize_ms_sum = 0.0
-        _epoch_preprocess_ms_sum = 0.0
-        _epoch_iter_ms_sum = 0.0
-        _epoch_n_iters = 0
         torch.cuda.synchronize()
         with StatisticsHelperInst.try_start(epoch):
             for i,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(train_loader):
@@ -242,16 +235,28 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 _all_iter_ms.append(_iter_ms)
                 total_iteration_time = _iter_ms
 
-                _epoch_loss_sum += loss.item()
-                _epoch_backward_ms_sum += backward_start.elapsed_time(backward_end)
-                _epoch_render_ms_sum += elapsed_times["render_time"]
-                _epoch_rasterize_ms_sum += elapsed_times["GaussiansRasterFunc_time"]
-                _epoch_iter_ms_sum += _iter_ms
-                _epoch_n_iters += 1
+                sum_time += _iter_ms
+
+                # get the mean, median, and std of the rendering of the last epoch! This is the inference speed??
+                if epoch == total_epoch - 1:
+                    if i == 0:
+                        print("Start logging render time! We are at the last epoch.")
+                    _all_rend_ms.append(elapsed_times["render_time"])
+
+                wandb.log({
+                    "train/total_loss":                          loss.item(),
+                    "gaussians/count":                           xyz.shape[1] * xyz.shape[2],
+                    "time/backward [ms]":                        backward_start.elapsed_time(backward_end),
+                    "time/render [ms]":                          elapsed_times["render_time"],
+                    "time/render/rasterize_forward [ms]":        elapsed_times["GaussiansRasterFunc_time"],
+                    "time/total_iteration [ms]":                 _iter_ms,
+                    "time/train_accumulated [ms]":               sum_time,
+                }, iteration)
                 if VERBOSE:
-                    sum_time += total_iteration_time
-                    _epoch_l1_sum += l1_loss.item()
-                    _epoch_preprocess_ms_sum += preprocess_start.elapsed_time(preprocess_end)
+                    wandb.log({
+                        "train/L1":                                          l1_loss.item(),
+                        "time/render_preprocess(cluster culling) [ms]":     preprocess_start.elapsed_time(preprocess_end),
+                    }, iteration)
                 
                 if prune_bool:
                     torch.cuda.synchronize()
@@ -262,21 +267,6 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     del img_scores
                 
                 iteration+=1
-
-        wandb.log({
-            "train/total_loss": _epoch_loss_sum / _epoch_n_iters,
-            "gaussians/count": xyz.shape[1] * xyz.shape[2],
-            "time/backward [ms]": _epoch_backward_ms_sum / _epoch_n_iters,
-            "time/render [ms]": _epoch_render_ms_sum / _epoch_n_iters,
-            "time/render/rasterize_forward [ms]": _epoch_rasterize_ms_sum / _epoch_n_iters,
-        }, epoch)
-        if VERBOSE:
-            wandb.log({
-                "train/L1": _epoch_l1_sum / _epoch_n_iters,
-                "time/render_preprocess(cluster culling) [ms]": _epoch_preprocess_ms_sum / _epoch_n_iters,
-                "time/total_iteration [ms]": _epoch_iter_ms_sum / _epoch_n_iters,
-                "time/sum_time [ms]": sum_time,
-            }, epoch)
 
         if _should_calibrate and _epoch_train_n > 0:
             density_controller.calibrate_ADP_from_quality(
@@ -376,23 +366,23 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"test/l1_loss_{name}" : l1_loss_test_mean.item(),
                         f"test/psnr_{name}" : psnr_mean.item(),
                         f"test/ssim_{name}" : ssim_mean.item(),
-                    }, epoch)
+                    }, iteration)
 
                     if name=="Testset":
                         wandb.log({
                             f"test/renders_{name}" : logged_images,   # <-- 6 side-by-side images
-                        }, epoch)
+                        }, iteration)
 
                     if epoch==total_epoch-1:
                         wandb.log({
                             f"test/lpips_{name}" : lpips_mean.item(),
-                        }, epoch)
+                        }, iteration)
 
                     if VERBOSE:
                         if name=="Testset":
                             wandb.log({
                                 f"test/renders_{name}" : logged_images,
-                            }, epoch)
+                            }, iteration)
                             
                     tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {} with xyz.shape {}".format(epoch,name,psnr_mean, str(xyz.shape)))
 
@@ -411,7 +401,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 "time/densification_pruning [ms]": densification_pruning_time,
                 "time/total_iteration_with_pruning [ms]": total_iteration_with_pruning_time,
                 "time/sum_time_with_prune [ms]": sum_time_with_prune,
-            }, epoch)
+            }, iteration)
 
         progress_bar.update()
 
@@ -439,19 +429,27 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
     # --- Benchmark Summary ---
     _bench_iters = np.array(_all_iter_ms[_WARMUP_ITERS:]) if len(_all_iter_ms) > _WARMUP_ITERS else np.array(_all_iter_ms)
+    _bench_rend = (
+        np.array(_all_rend_ms[_WARMUP_ITERS:])
+        if len(_all_rend_ms) > _WARMUP_ITERS
+        else np.array(_all_rend_ms)
+    )
     _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
     _total_iter_s    = np.array(_all_iter_ms).sum() / 1000
     _total_densify_s = _densify_arr.sum() / 1000
 
     _gpu_name = torch.cuda.get_device_name(0)
     _bench_scalars = {
-        "benchmark/iter_mean_ms":         float(np.mean(_bench_iters)),
-        "benchmark/iter_median_ms":       float(np.median(_bench_iters)),
-        "benchmark/iter_std_ms":          float(np.std(_bench_iters)),
-        "benchmark/densify_mean_ms":      float(np.mean(_densify_arr)),
-        "benchmark/densify_total_s":      round(_total_densify_s, 3),
-        "benchmark/total_training_s":     round(_total_iter_s, 3),
-        "benchmark/total_with_densify_s": round(_total_iter_s + _total_densify_s, 3),
+        "benchmark/iter_mean_ms":                   float(np.mean(_bench_iters)),
+        "benchmark/iter_median_ms":                 float(np.median(_bench_iters)),
+        "benchmark/iter_std_ms":                    float(np.std(_bench_iters)),
+        "benchmark/final_epoch_render_mean_ms":     float(np.mean(_bench_rend)),
+        "benchmark/final_epoch_render_median_ms":   float(np.median(_bench_rend)),
+        "benchmark/final_epoch_render_std_ms":      float(np.std(_bench_rend)),
+        "benchmark/densify_mean_ms":                float(np.mean(_densify_arr)),
+        "benchmark/densify_total_s":                round(_total_densify_s, 3),
+        "benchmark/total_training_s":               round(_total_iter_s, 3),
+        "benchmark/total_with_densify_s":           round(_total_iter_s + _total_densify_s, 3),
     }
     wandb.log({
         **_bench_scalars,
